@@ -17,6 +17,7 @@ python3 scripts/assemble_template.py
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text --region "$REGION")"
 BUCKET="${DEPLOY_BUCKET:-api-review-code-${ACCOUNT}-${REGION}}"
 STACK="${STACK_NAME:-api-review}"
+CODE_KEY="api-review/lambda-$(sha256sum "$ROOT/build/lambda.zip" | cut -c1-16).zip"
 if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
   if [[ "$REGION" == "us-east-1" ]]; then
     aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
@@ -24,7 +25,7 @@ if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1
     aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --create-bucket-configuration "LocationConstraint=${REGION}"
   fi
 fi
-aws s3 cp "$ROOT/build/lambda.zip" "s3://${BUCKET}/api-review/lambda.zip" --region "$REGION"
+aws s3 cp "$ROOT/build/lambda.zip" "s3://${BUCKET}/${CODE_KEY}" --region "$REGION"
 aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK" \
@@ -32,10 +33,10 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM --s3-bucket "${BUCKET}" --s3-prefix api-review/templates \
   --parameter-overrides \
     "LambdaCodeBucket=${BUCKET}" \
-    "LambdaCodeKey=api-review/lambda.zip" \
+    "LambdaCodeKey=${CODE_KEY}" \
     "OtelLayerArn=${OTEL_LAYER_ARN}" \
     "ProjectName=${PROJECT_NAME:-api-review}" \
-    "DeploymentNonce=${DEPLOYMENT_NONCE:-1}"
+    "DeploymentNonce=${DEPLOYMENT_NONCE:-$(date +%s)}"
 aws cloudformation describe-stacks \
   --region "$REGION" \
   --stack-name "$STACK" \
