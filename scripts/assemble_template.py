@@ -358,9 +358,20 @@ def build_template() -> dict:
             "LOCAL_IDENTITY_SIMULATION": "false",
             "MOCK_API_HOST": {"Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"},
             "MOCK_STAGE": "live",
+            # The layer only selects aws_distro when Application Signals is true.
+            # With it false, spans default to localhost:4318 and the Trace Map stays empty.
+            # Export directly to the X-Ray OTLP endpoint, which Transaction Search stores in aws/spans.
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {"Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"},
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {"Fn::Sub": f"${{ProjectName}}-{suffix}"},
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {"Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"},

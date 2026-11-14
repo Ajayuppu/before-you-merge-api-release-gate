@@ -59,7 +59,25 @@ def test_template_contracts():
     assert bedrock_actions.count("bedrock:InvokeModel") == 3
     assert all(not str(action).endswith(":*") and not str(action).startswith("bedrock:*") for action in bedrock_actions)
     assert resources["SpecCheckFunction"]["Properties"]["Environment"]["Variables"]["SPEC_CHECK_MODE"] == "in-process"
-    assert resources["SubmitFunction"]["Properties"]["Environment"]["Variables"]["AWS_LAMBDA_EXEC_WRAPPER"] == "/opt/otel-instrument"
+    submit_env = resources["SubmitFunction"]["Properties"]["Environment"]["Variables"]
+    assert submit_env["AWS_LAMBDA_EXEC_WRAPPER"] == "/opt/otel-instrument"
+    assert submit_env["OTEL_AWS_APPLICATION_SIGNALS_ENABLED"] == "false"
+    assert submit_env["OTEL_PYTHON_DISTRO"] == "aws_distro"
+    assert submit_env["OTEL_PYTHON_CONFIGURATOR"] == "aws_configurator"
+    assert submit_env["OTEL_TRACES_EXPORTER"] == "otlp"
+    assert submit_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert submit_env["OTEL_TRACES_SAMPLER"] == "parentbased_always_on"
+    assert submit_env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == {"Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"}
+    assert resources["SubmitFunction"]["Properties"]["TracingConfig"] == {"Mode": "Active"}
+    assert resources["ReviewStage"]["Properties"]["TracingEnabled"] is True
+    assert resources["ReviewStateMachine"]["Properties"]["TracingConfiguration"] == {"Enabled": True}
+    xray_actions = [
+        action
+        for statement in resources["SubmitRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+        for action in (statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]])
+    ]
+    assert "xray:PutTraceSegments" in xray_actions
+    assert "xray:PutTelemetryRecords" in xray_actions
     mock_paths = resources["MockApi"]["Properties"]["Body"]["paths"]
     assert "/orders-v1/orders" in mock_paths
     assert "19.95" in mock_paths["/orders-v1/orders"]["get"]["x-amazon-apigateway-integration"]["responses"]["default"]["responseTemplates"]["application/json"]

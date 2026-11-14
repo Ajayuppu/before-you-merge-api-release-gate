@@ -979,10 +979,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-submit"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1059,10 +1069,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-status"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1139,10 +1159,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-review"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1219,10 +1249,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-review-context"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1299,10 +1339,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-publisher"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1379,10 +1429,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-dispatcher"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1459,10 +1519,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-validate"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1539,10 +1609,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-diff"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1619,10 +1699,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-analyze"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1699,10 +1789,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-spec-check"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1779,10 +1879,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-harness"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1859,10 +1969,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-seal"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -1939,10 +2059,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-register-wait"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -2019,10 +2149,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-finalize"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
@@ -2099,10 +2239,20 @@
             },
             "MOCK_STAGE": "live",
             "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": {
+              "Fn::Sub": "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            },
+            "OTEL_LOGS_EXPORTER": "none",
+            "OTEL_METRICS_EXPORTER": "none",
             "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+            "OTEL_PYTHON_DISTRO": "aws_distro",
             "OTEL_SERVICE_NAME": {
               "Fn::Sub": "${ProjectName}-expire"
             },
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_TRACES_SAMPLER": "parentbased_always_on",
             "REVIEW_TTL_SECONDS": "3600",
             "SPEC_CHECK_MODE": "in-process",
             "STATE_MACHINE_ARN": {
