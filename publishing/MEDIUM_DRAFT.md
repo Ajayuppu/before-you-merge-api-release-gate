@@ -12,6 +12,6 @@ The broken orders example is deliberate. The candidate changes `amount` to a str
 
 Bedrock can explain the findings when you enable it. The explanation is not the gate. AgentCore, if you add it later, is allowed three tools: read artifacts, request the fixed spec check, and read test results. There is no approve tool. Amazon Q Developer stays in the IDE. It is not a runtime API in this design. The harness Lambda, not the code interpreter, performs the controlled call to the versioned mock. A SANDBOX interpreter can still reach AWS APIs such as S3, so it is not an air gap.
 
-The full walkthrough, local command output, CloudFormation, and the screenshot list are in `guide.md` in the project. Twenty-nine local tests passed in the reference run. The AWS stack was not deployed in that run, so this draft does not show a console and does not claim a cloud result.
+The full walkthrough is in `guide.md`. Deployed and validated live in us-east-1 on 14 November 2026. The suite is 68 or more tests. AgentCore Gateway, Policy, and Code Interpreter were validated: gateway-read PASS, approve denied by policy, another identity denied, and code-interpreter diff PASS. AgentCore Runtime was not deployed. The workflow uses `SPEC_CHECK_MODE=in-process`. This draft still has no screenshots.
 
 When you do deploy, capture the console at full window size. Blur account ids and credentials. Do not hide them behind black strips. Publish only after those pictures are real.

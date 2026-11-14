@@ -2,7 +2,7 @@
 
 Local reference and CloudShell deployment package for a serverless check that catches breaking OpenAPI changes before merge.
 
-The tested path is the Python package in `src/apireview`. It does not call AWS. CloudFormation, Step Functions, IAM, and AgentCore files under `cloud/` are deployment assets. They were assembled and contract-checked locally. They were not deployed.
+Deployed and validated live in us-east-1 on 14 November 2026. The suite is 68 or more tests. AgentCore Gateway, Policy, and Code Interpreter were validated: gateway-read PASS, approve denied by policy, another identity denied, and code-interpreter diff PASS. AgentCore Runtime was not deployed. The workflow uses `SPEC_CHECK_MODE=in-process`.
 
 Read [guide.md](guide.md) for the architecture, the local evidence, and the later CloudShell steps.
 

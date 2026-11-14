@@ -1,6 +1,6 @@
 {
-  "name": "api-review-tools",
-  "description": "MCP gateway for the three read-only review tools. Not created by the reference test run.",
+  "name": "ApiReviewTools",
+  "description": "MCP gateway for the three read-only review tools. Policy engine ApiReviewPolicy, target ReviewTools.",
   "authorizerType": "AWS_IAM",
   "protocolType": "MCP",
   "roleArn": "__GATEWAY_ROLE_ARN__",

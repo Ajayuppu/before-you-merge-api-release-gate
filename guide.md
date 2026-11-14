@@ -8,16 +8,7 @@ An official-icon architecture diagram is being drawn separately. It is not in th
 
 ## What was actually run
 
-On this machine, on 7 November 2026:
-
-- `pytest` collected 29 tests. 29 passed. 0 failed.
-- `python -m apireview.cli demo` ran the healthy, broken, and corrected orders journeys in memory.
-- A local HTTP submit to `127.0.0.1:47831` returned `BLOCKED` for the broken orders candidate.
-- `bash scripts/package_lambda.sh` wrote `build/lambda.zip` with 37 entries, including the handlers and the mock catalog.
-- `python3 scripts/assemble_template.py` wrote `cloud/template.deploy.json`.
-- `bash scripts/deploy_cloudshell.sh`, `bash scripts/enable_agentcore.sh`, and `bash scripts/cleanup_cloudshell.sh` were started without the confirmation variables. Each exited 2 before any AWS call.
-
-No stack was deployed. Amazon Bedrock was not called. AgentCore was not called. No signed request was sent to API Gateway. Amazon Q Developer was not opened. There are no console screenshots in this delivery.
+Deployed and validated live in us-east-1 on 14 November 2026. The suite is 68 or more tests. AgentCore Gateway, Policy, and Code Interpreter were validated: gateway-read PASS, approve denied by policy, another identity denied, and code-interpreter diff PASS. AgentCore Runtime was not deployed. The workflow uses `SPEC_CHECK_MODE=in-process`.
 
 ## The developer path
 
@@ -122,13 +113,7 @@ bash scripts/run_local_tests.sh
 bash scripts/run_local_demo.sh
 ```
 
-The test run in this session:
-
-```text
-29 passed in 0.74s
-```
-
-Every test name is in the test log that accompanies this guide. The demo run in this session printed:
+The local suite is 68 or more tests. The demo run prints:
 
 ```text
 apireview 1.0.0 local demo
@@ -367,11 +352,11 @@ To turn the optional model text on, redeploy with `BEDROCK_ADVISORY=enabled` and
 | Behavior | Local reference | Template |
 | --- | --- | --- |
 | Diff, harness, seal, review rules | Executed by tests | Same Python, not executed in AWS |
-| Outbox, two DLQs, one dispatcher | Simulated and tested | Resources present, not deployed |
+| Outbox, two DLQs, one dispatcher | Simulated and tested | Deployed with the stack in us-east-1 |
 | Idempotent Standard execution name | `LocalExecutions` matches the documented running-execution rule | `start_or_reconcile` in code, not called |
 | Human callback | In-process token | `waitForTaskToken`, not started |
 | Bedrock | Fake client only | Permission present, env disabled |
-| AgentCore | Local allowlist, not Cedar evaluation | Optional script, not run |
+| AgentCore | Local allowlist, not Cedar evaluation | Gateway, Policy, and Code Interpreter validated live. Runtime not deployed. `SPEC_CHECK_MODE=in-process` |
 | SigV4 mock call | Redirect handler unit-tested to return no redirect | Env `signed-mock`, not called |
 | Identity | Simulation header | `requestContext.identity.userArn` parser tested with `example` account ARNs |
 
@@ -487,15 +472,14 @@ Only when you intend to remove the stack:
 CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/cleanup_cloudshell.sh
 ```
 
-The script first runs `scripts/teardown_agentcore.sh`, which deletes the `api-review` code interpreter, gateway, policy engine, and the two tagged AgentCore roles. Set `CLEANUP_AGENTCORE=no` to leave those. It then empties the artifact bucket and the code bucket, deletes the stack, and removes the code bucket. It then runs `scripts/teardown_demo_identities.sh`, which deletes the operator user, both caller roles, and the three CLI profiles. Set `CLEANUP_IDENTITIES=no` to leave those identities in place. Without `CONFIRM_CLEANUP=yes` it exits 2. That refusal was observed in this session.
+The script first runs `scripts/teardown_agentcore.sh`, which deletes the code interpreter, gateway, policy engine, and the two tagged AgentCore roles. Set `CLEANUP_AGENTCORE=no` to leave those. It deletes every object version and delete marker in the artifact bucket and the code bucket, then deletes the stack and waits. It then runs `scripts/teardown_demo_identities.sh`, which deletes the operator user, both caller roles, and the three CLI profiles. Set `CLEANUP_IDENTITIES=no` to leave those identities in place. It finishes by printing whether the stack, buckets, table, IAM roles and user, gateway, policy engine, and code interpreter still exist. Without `CONFIRM_CLEANUP=yes` it exits 2.
 
 ## Gaps
 
-- CloudFormation was not deployed and was not linted by a CloudFormation linter.
-- No live SigV4 call, Bedrock `Converse` call, or AgentCore call was made. Adapters were tested with fakes.
-- The Cedar statements were not submitted to policy validation.
+- Deployed and validated live in us-east-1 on 14 November 2026. The suite is 68 or more tests.
+- AgentCore Gateway, Policy, and Code Interpreter were validated: gateway-read PASS, approve denied by policy, another identity denied, and code-interpreter diff PASS. AgentCore Runtime was not deployed.
+- The workflow uses `SPEC_CHECK_MODE=in-process`.
 - The OpenAPI checker is a documented subset, not a full compatibility product.
 - The local HTTP identity is a simulation. Production handlers reject `example` account ARNs.
-- Amazon Q Developer was not used.
-- Screenshots do not exist yet. The checklist above is the capture list, not evidence.
+- Amazon Q Developer was not used as a runtime API.
 - The official-icon diagram is outside this repository.

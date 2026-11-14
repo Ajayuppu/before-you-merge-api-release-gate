@@ -1,4 +1,4 @@
-"""Offline checks for the deployment template. CloudFormation was not deployed."""
+"""Offline checks for the deployment template. These tests do not call CloudFormation."""
 
 from __future__ import annotations
 
