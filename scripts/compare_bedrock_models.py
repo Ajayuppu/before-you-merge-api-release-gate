@@ -9,16 +9,24 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 from apireview.advisory import build_converse_request, parse_converse_response
 
+# Sonnet 4.6 geo profile: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html
+# Llama 4 Maverick geo profile: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-4-maverick-17b-instruct.html
+# The Maverick card lists lifecycle Legacy. Sonnet 4.5 and Llama 3.3 70B were refused as Legacy in this account.
 DEFAULT_MODELS = (
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "us.anthropic.claude-sonnet-4-6",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.meta.llama3-3-70b-instruct-v1:0",
+    "us.meta.llama4-maverick-17b-instruct-v1:0",
     "us.mistral.pixtral-large-2502-v1:0",
     "us.amazon.nova-2-lite-v1:0",
 )
@@ -38,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--output", default="build/model-comparison.json")
+    parser.add_argument("--print-raw", action="store_true")
     return parser
 
 
@@ -53,6 +62,8 @@ def main() -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(render_markdown(document))
+    if args.print_raw:
+        print(render_raw(document))
     print(f"wrote {destination}")
     return 0
 
@@ -118,6 +129,11 @@ def one_run(client: Any, request: dict[str, Any], folded: bool) -> tuple[dict[st
         response = client.converse(**request)
     except Exception as exc:
         captured = captured_error(exc)
+        if captured and captured["code"] == "ValidationException" and "outputConfig" in request:
+            smaller = {key: value for key, value in request.items() if key != "outputConfig"}
+            row, used, folded_now = one_run(client, smaller, folded)
+            row["outputConfigDropped"] = True
+            return row, used, folded_now
         if captured and captured["code"] == "ValidationException" and not folded and "system" in request:
             folded_request = fold_system_into_user(request)
             return one_run(client, folded_request, True)
@@ -130,6 +146,9 @@ def one_run(client: Any, request: dict[str, Any], folded: bool) -> tuple[dict[st
     summary, suggested = advisory_text(parsed)
     usage = response.get("usage") or {}
     metrics = response.get("metrics") or {}
+    reason = parsed.get("error")
+    if reason is None:
+        reason = parsed.get("rejection")
     return (
         {
             "error": None,
@@ -137,6 +156,8 @@ def one_run(client: Any, request: dict[str, Any], folded: bool) -> tuple[dict[st
             "latencyMs": latency,
             "outputTokens": usage.get("outputTokens"),
             "parseOk": parsed.get("modelStatus") == "parsed",
+            "rawText": reply_text(response),
+            "rejection": reason,
             "serviceLatencyMs": metrics.get("latencyMs"),
             "stopReason": response.get("stopReason"),
             "suggestedFix": suggested,
@@ -145,6 +166,12 @@ def one_run(client: Any, request: dict[str, Any], folded: bool) -> tuple[dict[st
         request,
         folded,
     )
+
+
+def reply_text(response: dict[str, Any]) -> str:
+    content = ((response.get("output") or {}).get("message") or {}).get("content") or []
+    text = "".join(str(block.get("text") or "") for block in content if isinstance(block, dict))
+    return text[:4000]
 
 
 def fold_system_into_user(request: dict[str, Any]) -> dict[str, Any]:
@@ -190,6 +217,8 @@ def _error_row(latency: float, error: dict[str, str]) -> dict[str, Any]:
         "latencyMs": latency,
         "outputTokens": None,
         "parseOk": False,
+        "rawText": "",
+        "rejection": error.get("message"),
         "serviceLatencyMs": None,
         "stopReason": None,
         "suggestedFix": "",
@@ -232,6 +261,19 @@ def render_markdown(document: dict[str, Any]) -> str:
         else:
             lines.append("(no parsed advisory)")
         lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_raw(document: dict[str, Any]) -> str:
+    lines = ["## Raw replies"]
+    for model in document["models"]:
+        lines.append(f"### {model['modelId']}")
+        for index, row in enumerate(model["runs"], start=1):
+            lines.append(f"#### run {index}")
+            if row.get("rejection"):
+                lines.append(f"rejection: {row['rejection']}")
+            lines.append(row.get("rawText") or "(no text)")
+            lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 

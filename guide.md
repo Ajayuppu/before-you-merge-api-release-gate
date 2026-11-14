@@ -429,10 +429,13 @@ The diff and the harness still decide `BLOCKED` or `PASS`. Bedrock text cannot c
 ```bash
 python3 scripts/compare_bedrock_models.py \
   --region "$REGION" \
-  --report ~/broken-report.json
+  --report ~/broken-report.json \
+  --print-raw
 ```
 
-`--findings` can point at a JSON list of findings instead of a report. `--models` is a comma-separated list. The default list is `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, `us.anthropic.claude-haiku-4-5-20251001-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.mistral.pixtral-large-2502-v1:0`, and `us.amazon.nova-2-lite-v1:0`. The script writes `build/model-comparison.json` and prints a markdown table plus each model's first advisory text.
+`--findings` can point at a JSON list of findings instead of a report. `--models` is a comma-separated list. `--print-raw` prints the reply text. The script does not need `PYTHONPATH`. The default list is `us.anthropic.claude-sonnet-4-6`, `us.anthropic.claude-haiku-4-5-20251001-v1:0`, `us.meta.llama4-maverick-17b-instruct-v1:0`, `us.mistral.pixtral-large-2502-v1:0`, and `us.amazon.nova-2-lite-v1:0`. Those ids are the US geo inference profiles from the [Claude Sonnet 4.6 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html) and the [Llama 4 Maverick 17B Instruct model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-4-maverick-17b-instruct.html). The script writes `build/model-comparison.json`, including each raw reply truncated to 4000 characters and the rejection reason, and prints a markdown table plus each model's first advisory text.
+
+On 14 Nov 2026 in us-east-1, Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) and Llama 3.3 70B (`us.meta.llama3-3-70b-instruct-v1:0`) failed with `ResourceNotFoundException`: `Access denied. This Model is marked by provider as Legacy and you have not been actively using the model in the last 30 days. Please upgrade to an active model on Amazon Bedrock`. Sonnet 4.6 is Active on its model card. The Maverick card currently lists lifecycle Legacy with an end-of-life date of 30 Mar 2027, so an account that has not called it in 30 days can still be refused.
 
 Switch the deployed analyze function to one of those ids and turn the call on:
 

@@ -19,11 +19,56 @@ MODEL_ID_GLOBAL = "global.amazon.nova-2-lite-v1:0"
 
 _SYSTEM = (
     "You explain OpenAPI breaking changes for a human reviewer. "
-    "Respond with one JSON object and no markdown. "
-    "Keys allowed: explanations, proposals. "
+    "Return only one JSON object. No prose and no markdown fences. "
+    "The object has two arrays, explanations and proposals. "
+    "Each explanation is an object with a string field explanation. "
+    "Each proposal is an object with a string field description. "
     "Do not include verdict, approve, decision, principal, jobId, or code. "
-    "proposals are declarative descriptions, never executable source."
+    'Example: {"explanations":[{"explanation":"The response type changed."}],'
+    '"proposals":[{"description":"Restore the previous type."}]}'
 )
+
+# Converse structured output. Models that reject this field are retried without it.
+# https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html
+_ADVISORY_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["explanations", "proposals"],
+        "properties": {
+            "explanations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["explanation"],
+                    "properties": {"explanation": {"type": "string"}},
+                },
+            },
+            "proposals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["description"],
+                    "properties": {"description": {"type": "string"}},
+                },
+            },
+        },
+    }
+)
+
+# Unknown keys are dropped, not rejected. Only these aliases are renamed onto the two allowed fields.
+_KEY_ALIASES = {
+    "explanation": "explanations",
+    "summary": "explanations",
+    "summaries": "explanations",
+    "proposal": "proposals",
+    "suggestedfix": "proposals",
+    "suggestedfixes": "proposals",
+    "fix": "proposals",
+    "fixes": "proposals",
+}
 
 
 def deterministic_advisory(findings: list[dict[str, str]]) -> dict[str, Any]:
@@ -104,6 +149,18 @@ def build_converse_request(model_id: str, findings: list[dict[str, str]]) -> dic
         "system": [{"text": _SYSTEM}],
         "messages": [{"role": "user", "content": [{"text": prompt}]}],
         "inferenceConfig": {"maxTokens": 1024, "temperature": 0.0},
+        "outputConfig": {
+            "textFormat": {
+                "type": "json_schema",
+                "structure": {
+                    "jsonSchema": {
+                        "name": "advisory",
+                        "description": "Explanations and proposals. Not a verdict.",
+                        "schema": _ADVISORY_SCHEMA,
+                    }
+                },
+            }
+        },
     }
 
 
@@ -111,12 +168,53 @@ def invoke_converse(client: Any, model_id: str, findings: list[dict[str, str]]) 
     """Call Converse. A transport or service error becomes a recorded non-verdict."""
     try:
         request = build_converse_request(model_id, findings)
-        return parse_converse_response(client.converse(**request))
+        response = _send_converse(client, request)
+        return parse_converse_response(response)
     except Exception as exc:
         return model_call_error(exc)
 
 
+def _send_converse(client: Any, request: dict[str, Any]) -> dict[str, Any]:
+    """Retry once without structured output, then once with the system text folded in."""
+    current = dict(request)
+    dropped_output = False
+    folded = False
+    while True:
+        try:
+            return client.converse(**current)
+        except Exception as exc:
+            if _error_code(exc) != "ValidationException":
+                raise
+            if "outputConfig" in current and not dropped_output:
+                current = {key: value for key, value in current.items() if key != "outputConfig"}
+                dropped_output = True
+                continue
+            if "system" in current and not folded:
+                current = _fold_system(current)
+                folded = True
+                continue
+            raise
+
+
+def _fold_system(request: dict[str, Any]) -> dict[str, Any]:
+    folded = json.loads(json.dumps(request))
+    system = folded.pop("system", None) or []
+    instruction = "\n".join(str(block.get("text") or "") for block in system if isinstance(block, dict)).strip()
+    message = folded["messages"][0]["content"][0]
+    if instruction:
+        message["text"] = instruction + "\n" + str(message.get("text") or "")
+    return folded
+
+
+def _error_code(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return str((response.get("Error") or {}).get("Code") or "")
+    return type(exc).__name__
+
+
 def model_call_error(exc: BaseException) -> dict[str, Any]:
+    reason = f"{type(exc).__name__}: {exc}"
     return {
         "source": "bedrock-converse",
         "authoritative": False,
@@ -125,26 +223,32 @@ def model_call_error(exc: BaseException) -> dict[str, Any]:
         "proposals": [],
         "modelStatus": "error",
         "modelAdvisoryHash": None,
-        "rejection": f"{type(exc).__name__}: {exc}",
+        "rejection": reason,
+        "error": reason,
     }
 
 
 def parse_converse_response(response: dict[str, Any]) -> dict[str, Any]:
-    """Accept only a JSON object whose keys are on the allowlist."""
+    """Accept a JSON object of explanations and proposals.
+
+    Markdown fences are stripped. If the reply is not pure JSON, the first
+    balanced top-level object is used. A single object or string is wrapped
+    into a list. Aliases in `_KEY_ALIASES` are renamed; every other key is
+    dropped and is not a rejection. Forbidden content inside the two arrays
+    is still rejected. The result is never a verdict.
+    """
     try:
         blocks = response["output"]["message"]["content"]
         texts = [block["text"] for block in blocks if isinstance(block, dict) and "text" in block]
-        text = "".join(texts).strip()
-        parsed = json.loads(text)
-    except (KeyError, TypeError, json.JSONDecodeError):
+        text = _strip_fences("".join(texts).strip())
+        parsed = _load_first_object(text)
+    except (KeyError, TypeError, json.JSONDecodeError, ValueError):
         return _invalid("model output was not a JSON object")
     if not isinstance(parsed, dict):
         return _invalid("model output was not an object")
-    allowed = {"explanations", "proposals"}
-    if set(parsed) - allowed:
-        return _invalid("model output contained keys outside the allowlist")
-    explanations = parsed.get("explanations", [])
-    proposals = parsed.get("proposals", [])
+    normalized = _normalize_keys(parsed)
+    explanations = _as_list(normalized.get("explanations", []))
+    proposals = _as_list(normalized.get("proposals", []))
     if not isinstance(explanations, list) or not isinstance(proposals, list):
         return _invalid("model explanations or proposals were not arrays")
     if not _safe_tree(explanations) or not _safe_tree(proposals):
@@ -156,9 +260,87 @@ def parse_converse_response(response: dict[str, Any]) -> dict[str, Any]:
         "explanations": explanations,
         "proposals": proposals,
         "modelStatus": "parsed",
+        "rejection": None,
+        "error": None,
     }
     document["modelAdvisoryHash"] = sha256_text(canonical_dumps(document))
     return document
+
+
+def _strip_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _load_first_object(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            raise
+        fragment = _balanced_object(text, start)
+        return json.loads(fragment)
+
+
+def _balanced_object(text: str, start: int) -> str:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise ValueError("unbalanced JSON object")
+
+
+def _normalize_keys(parsed: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str):
+            continue
+        lowered = key.lower()
+        if lowered in {"explanations", "proposals"}:
+            target = lowered
+        else:
+            target = _KEY_ALIASES.get(lowered)
+        if target is None:
+            continue
+        incoming = _as_list(value)
+        if target in normalized and isinstance(normalized[target], list) and isinstance(incoming, list):
+            normalized[target] = normalized[target] + incoming
+        else:
+            normalized[target] = incoming
+    return normalized
+
+
+def _as_list(value: Any) -> Any:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (dict, str)):
+        return [value]
+    return value
 
 
 def _invalid(reason: str) -> dict[str, Any]:
@@ -171,6 +353,7 @@ def _invalid(reason: str) -> dict[str, Any]:
         "modelStatus": "rejected",
         "modelAdvisoryHash": None,
         "rejection": reason,
+        "error": reason,
     }
 
 
@@ -203,7 +386,11 @@ def merge_advisory(deterministic: dict[str, Any], model: dict[str, Any] | None) 
         return merged
     merged["modelStatus"] = model.get("modelStatus")
     merged["modelAdvisoryHash"] = model.get("modelAdvisoryHash")
-    merged["modelRejection"] = model.get("rejection")
+    reason = model.get("error")
+    if reason is None:
+        reason = model.get("rejection")
+    merged["modelRejection"] = reason
+    merged["error"] = reason
     if model.get("modelStatus") == "parsed":
         merged["modelExplanations"] = model.get("explanations", [])
         merged["modelProposals"] = model.get("proposals", [])

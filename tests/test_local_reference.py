@@ -336,8 +336,9 @@ def test_model_output_cannot_change_the_verdict():
     view = submit(broken, BROKEN, "orders-v2-broken", "model-key-000001")
     assert view["authoritativeVerdict"] == "BLOCKED"
     job = broken.store.get(f"job#{view['jobId']}")
-    assert job["advisory"]["modelStatus"] == "rejected"
+    assert job["advisory"]["modelStatus"] == "parsed"
     assert job["advisory"]["includedInVerdict"] is False
+    assert job["advisory"]["error"] is None
 
     class PassingLie:
         def converse(self, **kwargs):
@@ -348,7 +349,10 @@ def test_model_output_cannot_change_the_verdict():
     assert view["authoritativeVerdict"] == "PASS"
     request = build_converse_request("us.amazon.nova-2-lite-v1:0", [])
     assert request["inferenceConfig"]["maxTokens"] == 1024
-    assert parse_converse_response(FakeModel().converse(**request))["modelStatus"] == "rejected"
+    parsed = parse_converse_response(FakeModel().converse(**request))
+    assert parsed["modelStatus"] == "parsed"
+    assert parsed["includedInVerdict"] is False
+    assert parsed["explanations"] == []
 
     class Unavailable:
         def converse(self, **kwargs):

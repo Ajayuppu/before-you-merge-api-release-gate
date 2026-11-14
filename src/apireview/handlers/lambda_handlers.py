@@ -611,7 +611,7 @@ def _advisory_report(advisory: dict[str, Any] | None) -> dict[str, Any]:
     advisory = advisory or {}
     return {
         "authoritative": False,
-        "error": advisory.get("modelRejection"),
+        "error": advisory.get("error") if advisory.get("error") is not None else advisory.get("modelRejection"),
         "includedInVerdict": False,
         "modelStatus": advisory.get("modelStatus"),
         "source": advisory.get("source"),

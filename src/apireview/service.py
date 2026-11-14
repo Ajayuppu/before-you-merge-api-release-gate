@@ -373,7 +373,7 @@ class ReviewService:
         return {
             "advisoryAuthoritative": False,
             "checkerAuthoritative": False,
-            "error": stored.get("modelRejection"),
+            "error": stored.get("error") if stored.get("error") is not None else stored.get("modelRejection"),
             "evidence": job["evidence"],
             "explanations": stored.get("explanations", []),
             "job": self.public_job(job, principal),
