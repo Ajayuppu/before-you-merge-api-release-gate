@@ -29,12 +29,21 @@ POLICY_NAMES = ("AllowReadArtifacts", "AllowRequestSpecCheck", "AllowReadTestRes
 SESSION_NAME = "ApiReviewValidate"
 TAG_KEY = "api-review"
 TAG_VALUE = "agentcore"
-READ_TOOL = "ReviewTools___read_artifacts"
-APPROVE_TOOL = "ReviewTools___approve"
+# MCP tool and Cedar action id: ${target_name}___${tool_name}
+# https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-tool-naming.html
+# https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-scope.html
+TOOL_SEPARATOR = "___"
+READ_TOOL = f"ReviewTools{TOOL_SEPARATOR}read_artifacts"
+APPROVE_TOOL = f"ReviewTools{TOOL_SEPARATOR}approve"
 ALLOWED_SCOPE = (
-    "ReviewTools___read_artifacts",
-    "ReviewTools___request_spec_check",
-    "ReviewTools___read_test_results",
+    f"ReviewTools{TOOL_SEPARATOR}read_artifacts",
+    f"ReviewTools{TOOL_SEPARATOR}request_spec_check",
+    f"ReviewTools{TOOL_SEPARATOR}read_test_results",
+)
+POLICY_TOOLS = (
+    ("AllowReadArtifacts", "read_artifacts"),
+    ("AllowRequestSpecCheck", "request_spec_check"),
+    ("AllowReadTestResults", "read_test_results"),
 )
 EXPECTED_CHECKER_RULES = frozenset({"checker.amount.type", "checker.next_cursor.required"})
 # Live gateways created before the later protocol versions advertise only this one.
@@ -232,13 +241,108 @@ def statements_match(left: str, right: str) -> bool:
 
 def policy_statement_text(policy: dict[str, Any]) -> str:
     definition = policy.get("definition") or {}
-    cedar = definition.get("cedar") or {}
-    if isinstance(cedar, dict) and cedar.get("statement"):
-        return str(cedar["statement"])
-    nested = definition.get("policy") or {}
-    if isinstance(nested, dict) and nested.get("statement"):
-        return str(nested["statement"])
+    for key in ("policy", "cedar"):
+        body = definition.get(key) or {}
+        if isinstance(body, dict) and body.get("statement"):
+            return str(body["statement"])
     return ""
+
+
+def policy_status_reasons(policy: dict[str, Any]) -> list[str]:
+    reasons = policy.get("statusReasons")
+    if reasons is None:
+        reasons = policy.get("statusReason") or []
+    if isinstance(reasons, str):
+        return [reasons]
+    return [str(item) for item in reasons]
+
+
+def format_policy(policy: dict[str, Any], name: str = "") -> str:
+    reasons = policy_status_reasons(policy)
+    return (
+        f"policy {policy.get('name') or name} "
+        f"status={policy.get('status')} enforcement={policy.get('enforcementMode')} "
+        f"statusReasons={reasons or 'none'} statement={policy_statement_text(policy)!r}"
+    )
+
+
+def action_id(target_name: str, tool_name: str) -> str:
+    """Cedar action id is the MCP tool name. A name that already includes the target is kept."""
+    for separator in (TOOL_SEPARATOR, "__"):
+        if tool_name.startswith(f"{target_name}{separator}"):
+            return tool_name
+    return f"{target_name}{TOOL_SEPARATOR}{tool_name}"
+
+
+def target_tool_names(target: dict[str, Any]) -> list[str]:
+    """Tool names from GetGatewayTarget: overrides, then any inline tool schema."""
+    config = ((target.get("targetConfiguration") or {}).get("mcp") or {})
+    api = config.get("apiGateway") or {}
+    tool_config = api.get("apiGatewayToolConfiguration") or {}
+    names: list[str] = []
+    for item in tool_config.get("toolOverrides") or []:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    for name in _schema_tool_names(config):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def permitted_action_ids(target_name: str, tool_names: list[str]) -> list[tuple[str, str]]:
+    paired: list[tuple[str, str]] = []
+    for policy_name, tool_name in POLICY_TOOLS:
+        match = tool_name
+        for discovered in tool_names:
+            if discovered == tool_name or discovered.endswith(f"{TOOL_SEPARATOR}{tool_name}") or discovered.endswith(f"__{tool_name}"):
+                match = discovered
+                break
+        paired.append((policy_name, action_id(target_name, match)))
+    return paired
+
+
+def permit_statement(gateway_arn: str, action: str) -> str:
+    """AWS_IAM callers are AgentCore::IamEntity. A specific action requires the gateway ARN.
+
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-scope.html
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies.html
+    """
+    return (
+        "permit (\n"
+        "  principal is AgentCore::IamEntity,\n"
+        f'  action == AgentCore::Action::"{action}",\n'
+        f'  resource == AgentCore::Gateway::"{gateway_arn}"\n'
+        ");\n"
+    )
+
+
+def _schema_tool_names(node: Any) -> list[str]:
+    found: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            inline = value.get("inlinePayload")
+            tools: list[Any] = []
+            if isinstance(inline, list):
+                tools = inline
+            elif isinstance(inline, str) and inline.strip().startswith("["):
+                try:
+                    parsed = json.loads(inline)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    tools = parsed
+            for tool in tools:
+                if isinstance(tool, dict) and tool.get("name"):
+                    found.append(str(tool["name"]))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(node)
+    return found
 
 
 def tools_or_allowed_scope(names: list[str]) -> tuple[list[str], bool]:
@@ -459,7 +563,13 @@ def enable(region: str) -> None:
     gateway = _ensure_gateway(control, gateway_role, engine["arn"])
     _wait_ready(lambda: control.get_gateway(gatewayIdentifier=gateway["id"]), "gateway")
     _ensure_target(control, gateway["id"], api_id)
-    _ensure_policies(control, engine["id"], gateway["arn"])
+    target_id = _target_id(control, gateway["id"])
+    if not target_id:
+        raise SystemExit(f"Gateway target {TARGET_NAME} was not created")
+    target = control.get_gateway_target(gatewayIdentifier=gateway["id"], targetId=target_id)
+    discovered = target_tool_names(target)
+    print(f"target tools {discovered}")
+    _ensure_policies(control, engine["id"], gateway["arn"], str(target.get("name") or TARGET_NAME), discovered)
     state = {
         "account": account,
         "engineArn": engine["arn"],
@@ -534,7 +644,9 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
     print(f"tools/list {list_body}")
     names, used_scope = tools_or_allowed_scope(tool_names_from_list(list_body))
     if used_scope:
+        names = _permitted_names(region, state) or names
         print("allowed-scope " + ", ".join(repr(name) for name in names))
+        print("tools/list is empty because ENFORCE shows only tools an ACTIVE permit allows. A failed policy permits nothing.")
     read_name, approve_name = select_gateway_tools(names)
     if not read_name or not approve_name:
         detail = list_body[:300] if list_status else "tools/list returned no read_artifacts tool"
@@ -959,34 +1071,29 @@ def _wait_review_target(region: str, state: dict[str, str]) -> None:
     raise SystemExit("gateway target was not ready")
 
 
-def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
-    files = [
-        ("AllowReadArtifacts", ROOT / "cloud/agentcore/allow-read-artifacts.cedar"),
-        ("AllowRequestSpecCheck", ROOT / "cloud/agentcore/allow-request-spec-check.cedar"),
-        ("AllowReadTestResults", ROOT / "cloud/agentcore/allow-read-test-results.cedar"),
-    ]
+def _ensure_policies(control, engine_id: str, gateway_arn: str, target_name: str, tool_names: list[str]) -> None:
     current = {item.get("name"): item for item in _policy_records(control, engine_id)}
-    for name, path in files:
-        statement = render_policy(path.read_text(encoding="utf-8"), gateway_arn)
+    for name, action in permitted_action_ids(target_name, tool_names):
+        statement = permit_statement(gateway_arn, action)
+        print(f"policy {name} desired-action={action!r}")
         found = current.get(name)
+        if found and _failed_policy(control, engine_id, found):
+            found = None
         if not found:
-            created = control.create_policy(
-                policyEngineId=engine_id,
-                name=name,
-                validationMode="FAIL_ON_ANY_FINDINGS",
-                enforcementMode="ACTIVE",
-                definition={"cedar": {"statement": statement}},
-            )
-            print(f"Created policy {name}.")
-            _wait_policy(control, engine_id, created.get("policyId") or "", name)
+            _create_policy(control, engine_id, name, statement)
             continue
         policy_id = found.get("policyId") or found.get("id") or ""
         detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
-        status = str(detail.get("status") or "")
+        status = str(detail.get("status") or "").upper()
         same = statements_match(policy_statement_text(detail), statement) and detail.get("enforcementMode") == "ACTIVE"
-        if same and not status.endswith("FAILED"):
+        if same and status == "ACTIVE":
             print(f"Policy {name} already exists.")
-            _wait_policy(control, engine_id, policy_id, name)
+            print(format_policy(detail, name))
+            continue
+        print(format_policy(detail, name))
+        if status.endswith("FAILED"):
+            _delete_policy(control, engine_id, policy_id, name)
+            _create_policy(control, engine_id, name, statement)
             continue
         print(f"Updating policy {name}.")
         control.update_policy(
@@ -996,7 +1103,67 @@ def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
             enforcementMode="ACTIVE",
             validationMode="FAIL_ON_ANY_FINDINGS",
         )
-        _wait_policy(control, engine_id, policy_id, name)
+        updated = _wait_policy(control, engine_id, policy_id, name)
+        if str(updated.get("status") or "").upper().endswith("FAILED"):
+            _delete_policy(control, engine_id, policy_id, name)
+            _create_policy(control, engine_id, name, statement)
+
+
+def _failed_policy(control, engine_id: str, found: dict[str, Any]) -> bool:
+    policy_id = found.get("policyId") or found.get("id") or ""
+    if not policy_id:
+        return False
+    detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
+    status = str(detail.get("status") or "").upper()
+    if not status.endswith("FAILED"):
+        return False
+    print(format_policy(detail, str(found.get("name") or "")))
+    _delete_policy(control, engine_id, policy_id, str(found.get("name") or policy_id))
+    return True
+
+
+def _create_policy(control, engine_id: str, name: str, statement: str) -> None:
+    # Schema validation is asynchronous. GetPolicy statusReasons is the validation report.
+    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-create-update-validation.html
+    created = control.create_policy(
+        policyEngineId=engine_id,
+        name=name,
+        validationMode="FAIL_ON_ANY_FINDINGS",
+        enforcementMode="ACTIVE",
+        definition={"cedar": {"statement": statement}},
+    )
+    print(f"Created policy {name}.")
+    detail = _wait_policy(control, engine_id, created.get("policyId") or "", name)
+    if str(detail.get("status") or "").upper() != "ACTIVE":
+        raise SystemExit(format_policy(detail, name))
+
+
+def _delete_policy(control, engine_id: str, policy_id: str, name: str) -> None:
+    control.delete_policy(policyEngineId=engine_id, policyId=policy_id)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        try:
+            detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
+        except Exception as exc:
+            if _is_not_found(exc):
+                print(f"Deleted policy {name}.")
+                return
+            time.sleep(5)
+            continue
+        status = str(detail.get("status") or "").upper()
+        if status == "DELETE_FAILED":
+            raise SystemExit(format_policy(detail, name))
+        time.sleep(5)
+    raise SystemExit(f"policy {name} was not deleted")
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    code = ""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str((response.get("Error") or {}).get("Code") or "")
+    text = str(exc).lower()
+    return "NotFound" in type(exc).__name__ or "NotFound" in code or "not found" in text
 
 
 def _policy_records(control, engine_id: str) -> list[dict[str, Any]]:
@@ -1013,10 +1180,38 @@ def _policy_records(control, engine_id: str) -> list[dict[str, Any]]:
             return records
 
 
-def _wait_policy(control, engine_id: str, policy_id: str, name: str) -> None:
+def _wait_policy(control, engine_id: str, policy_id: str, name: str) -> dict[str, Any]:
     if not policy_id:
         raise SystemExit(f"policy {name} has no id")
-    _wait_ready(lambda: control.get_policy(policyEngineId=engine_id, policyId=policy_id), f"policy {name}")
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
+        status = str(detail.get("status") or "").upper()
+        if status == "ACTIVE" or status.endswith("FAILED"):
+            print(format_policy(detail, name))
+            return detail
+        time.sleep(5)
+    raise SystemExit(f"policy {name} was not ready")
+
+
+def _permitted_names(region: str, state: dict[str, str]) -> list[str]:
+    gateway_id = state.get("gatewayId") or ""
+    if not gateway_id:
+        return []
+    try:
+        import boto3
+
+        control = boto3.client("bedrock-agentcore-control", region_name=region)
+        target_id = _target_id(control, gateway_id)
+        if not target_id:
+            return []
+        target = control.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
+    except Exception as exc:
+        print(f"target tools unavailable: {exc}")
+        return []
+    discovered = target_tool_names(target)
+    print(f"target tools {discovered}")
+    return [action for _name, action in permitted_action_ids(str(target.get("name") or TARGET_NAME), discovered)]
 
 
 def _print_policies(region: str, state: dict[str, str]) -> None:
@@ -1042,11 +1237,7 @@ def _print_policies(region: str, state: dict[str, str]) -> None:
         except Exception as exc:
             print(f"policy {item.get('name')} get failed: {exc}")
             continue
-        print(
-            f"policy {detail.get('name') or item.get('name')} "
-            f"status={detail.get('status')} enforcement={detail.get('enforcementMode')} "
-            f"statement={policy_statement_text(detail)!r}"
-        )
+        print(format_policy(detail, str(item.get("name") or "")))
 
 
 def _wait_ready(reader, label: str) -> None:
@@ -1061,7 +1252,9 @@ def _wait_ready(reader, label: str) -> None:
         if status in {"READY", "ACTIVE", ""}:
             return
         if "FAIL" in status or "UNSUCCESSFUL" in status:
-            raise SystemExit(f"{label} entered {status}")
+            reasons = payload.get("statusReasons") or []
+            detail = f" statusReasons={reasons}" if reasons else ""
+            raise SystemExit(f"{label} entered {status}{detail}")
         time.sleep(5)
     raise SystemExit(f"{label} was not ready")
 

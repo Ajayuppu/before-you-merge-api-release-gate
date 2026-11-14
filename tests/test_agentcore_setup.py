@@ -11,7 +11,6 @@ from scripts.agentcore_setup import (
     MCP_PROTOCOL_VERSION,
     NAME_PATTERNS,
     READ_TOOL,
-    ROOT,
     SERVICE_PRINCIPAL,
     _stream_text,
     checker_result_ok,
@@ -22,12 +21,16 @@ from scripts.agentcore_setup import (
     gateway_source_arn,
     negotiated_protocol,
     parse_checker_output,
+    action_id,
+    format_policy,
+    permitted_action_ids,
+    permit_statement,
     policy_engine_attached,
     policy_statement_text,
+    policy_status_reasons,
     protocol_from_gateway,
-    render_policy,
     select_gateway_tools,
-    statements_match,
+    target_tool_names,
     tool_configuration,
     tool_names_from_list,
     tools_or_allowed_scope,
@@ -105,27 +108,46 @@ def test_checker_output_parses_the_first_object_and_expected_findings():
     assert checker_result_ok(parse_checker_output(raw[:120])) is False
 
 
-def test_iam_permits_use_the_documented_action_and_principal():
+def test_iam_permits_use_the_target_tool_names_and_report_failures():
     arn = "arn:aws:bedrock-agentcore:us-east-1:111122223333:gateway/apireviewtools-l0jmrlboyy"
-    rendered = render_policy((ROOT / "cloud/agentcore/allow-read-artifacts.cedar").read_text(encoding="utf-8"), arn)
-    assert "principal is AgentCore::IamEntity" in rendered
-    assert 'AgentCore::Action::"ReviewTools___read_artifacts"' in rendered
-    assert "ReviewTools" + "___" + "read_artifacts" in rendered
-    assert "approve" not in rendered
-    assert arn in rendered
-    old = rendered.replace("principal is AgentCore::IamEntity", "principal")
-    assert statements_match(old, rendered) is False
-    assert statements_match(rendered, rendered.replace("\n", " ")) is True
-    assert policy_statement_text({"definition": {"cedar": {"statement": rendered}}}) == rendered
-    others = [
-        ROOT / "cloud/agentcore/allow-request-spec-check.cedar",
-        ROOT / "cloud/agentcore/allow-read-test-results.cedar",
-    ]
-    for path in others:
-        text = render_policy(path.read_text(encoding="utf-8"), arn)
-        assert "principal is AgentCore::IamEntity" in text
-        assert "___" in text
-        assert "approve" not in text
+    target = {
+        "name": "ReviewTools",
+        "targetConfiguration": {
+            "mcp": {
+                "apiGateway": {
+                    "apiGatewayToolConfiguration": {
+                        "toolFilters": [{"filterPath": "/jobs/{jobId}", "methods": ["GET"]}],
+                        "toolOverrides": [
+                            {"name": "read_artifacts", "path": "/jobs/{jobId}", "method": "GET"},
+                            {"name": "request_spec_check", "path": "/jobs/{jobId}/report", "method": "GET"},
+                            {"name": "read_test_results", "path": "/jobs", "method": "POST"},
+                            {"name": "approve", "path": "/reviews", "method": "POST"},
+                        ],
+                    }
+                }
+            }
+        },
+    }
+    assert target_tool_names(target) == ["read_artifacts", "request_spec_check", "read_test_results", "approve"]
+    actions = permitted_action_ids("ReviewTools", target_tool_names(target))
+    assert actions[0] == ("AllowReadArtifacts", "ReviewTools" + "___" + "read_artifacts")
+    assert all("approve" not in action for _name, action in actions)
+    assert action_id("ReviewTools", "ReviewTools__read_artifacts") == "ReviewTools__read_artifacts"
+    statement = permit_statement(arn, actions[0][1])
+    assert "principal is AgentCore::IamEntity" in statement
+    assert f'resource == AgentCore::Gateway::"{arn}"' in statement
+    assert 'AgentCore::Action::"ReviewTools___read_artifacts"' in statement
+    failed = {
+        "name": "AllowReadArtifacts",
+        "status": "CREATE_FAILED",
+        "enforcementMode": "ACTIVE",
+        "statusReasons": ["Validation failed: Action 'read_artifacts' is not defined in the schema for any associated gateway"],
+        "definition": {"cedar": {"statement": "permit (principal, action, resource);"}},
+    }
+    assert policy_status_reasons(failed)[0].startswith("Validation failed")
+    assert "CREATE_FAILED" in format_policy(failed)
+    assert "statusReasons=" in format_policy(failed)
+    assert policy_statement_text({"definition": {"policy": {"statement": statement}}}) == statement
 
 
 def test_code_interpreter_trust_uses_the_documented_source_arn():
