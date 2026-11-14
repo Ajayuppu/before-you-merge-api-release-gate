@@ -302,10 +302,24 @@ def build_template() -> dict:
             {
                 "Action": ["bedrock:InvokeModel"],
                 "Effect": "Allow",
-                "Resource": [
-                    {"Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-2-lite-v1:0"},
-                    {"Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"},
-                ],
+                "Resource": {"Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"},
+            },
+            {
+                "Action": ["bedrock:InvokeModel"],
+                "Condition": {
+                    "StringLike": {
+                        "bedrock:InferenceProfileArn": {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                        }
+                    }
+                },
+                "Effect": "Allow",
+                "Resource": {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*::foundation-model/*"},
+            },
+            {
+                "Action": ["bedrock:InvokeModel"],
+                "Effect": "Allow",
+                "Resource": {"Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"},
             },
         ]
     )
@@ -336,7 +350,7 @@ def build_template() -> dict:
         }
         environment = {
             "ARTIFACT_BUCKET_NAME": {"Ref": "ArtifactBucket"},
-            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_ADVISORY": {"Ref": "BedrockAdvisory"},
             "BEDROCK_MODEL_ID": {"Ref": "BedrockModelId"},
             "EVENT_BUS_NAME": {"Ref": "ReviewBus"},
             "HARNESS_TRANSPORT": "signed-mock",
@@ -531,9 +545,15 @@ def build_template() -> dict:
         "AWSTemplateFormatVersion": "2010-09-09",
         "Description": "Serverless API breaking-change review gate. Research deployment asset. Not executed in the reference test run.",
         "Parameters": {
+            "BedrockAdvisory": {
+                "AllowedValues": ["disabled", "enabled"],
+                "Default": "disabled",
+                "Description": "enabled calls Bedrock Converse from the analyze function. The model text is not a verdict.",
+                "Type": "String",
+            },
             "BedrockModelId": {
                 "Default": "us.amazon.nova-2-lite-v1:0",
-                "Description": "Bedrock model id used only if BEDROCK_ADVISORY is later changed to enabled.",
+                "Description": "Bedrock model id or inference profile id used only when BedrockAdvisory is enabled.",
                 "Type": "String",
             },
             "DeploymentNonce": {

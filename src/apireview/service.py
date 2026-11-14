@@ -369,13 +369,16 @@ class ReviewService:
         if not job.get("evidence"):
             raise FailClosed("report is not sealed yet")
         self._recheck_evidence(job)
+        stored = job.get("advisory") or {}
         return {
             "advisoryAuthoritative": False,
             "checkerAuthoritative": False,
+            "error": stored.get("modelRejection"),
             "evidence": job["evidence"],
-            "explanations": job.get("advisory", {}).get("explanations", []),
+            "explanations": stored.get("explanations", []),
             "job": self.public_job(job, principal),
-            "proposals": job.get("advisory", {}).get("proposals", []),
+            "proposals": stored.get("proposals", []),
+            "source": stored.get("source"),
         }
 
     def _drive(self, execution: Any, job_id: str) -> None:
@@ -453,10 +456,9 @@ class ReviewService:
             raise ValidationFailed("analysis tried to claim authority")
         model_result = None
         if self.model_client is not None and self.model_id:
-            from apireview.advisory import build_converse_request, parse_converse_response
+            from apireview.advisory import invoke_converse
 
-            request = build_converse_request(self.model_id, job["findings"])
-            model_result = parse_converse_response(self.model_client.converse(**request))
+            model_result = invoke_converse(self.model_client, self.model_id, job["findings"])
         advisory = merge_advisory(advisory, model_result)
         trace = self._agent_trace(job)
         self._transition(

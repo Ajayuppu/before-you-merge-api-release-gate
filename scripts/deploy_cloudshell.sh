@@ -36,6 +36,8 @@ aws cloudformation deploy \
     "LambdaCodeKey=${CODE_KEY}" \
     "OtelLayerArn=${OTEL_LAYER_ARN}" \
     "ProjectName=${PROJECT_NAME:-api-review}" \
+    "BedrockAdvisory=${BEDROCK_ADVISORY:-disabled}" \
+    "BedrockModelId=${BEDROCK_MODEL_ID:-us.amazon.nova-2-lite-v1:0}" \
     "DeploymentNonce=${DEPLOYMENT_NONCE:-$(date +%s)}"
 aws cloudformation describe-stacks \
   --region "$REGION" \

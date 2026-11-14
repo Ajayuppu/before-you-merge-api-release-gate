@@ -51,7 +51,13 @@ def test_template_contracts():
     assert states["States"]["Gate"]["Default"] == "MarkBlocked"
     assert "arn:aws:states:::states:startExecution" not in rendered
     assert resources["HarnessFunction"]["Properties"]["Environment"]["Variables"]["HARNESS_TRANSPORT"] == "signed-mock"
-    assert resources["AnalyzeFunction"]["Properties"]["Environment"]["Variables"]["BEDROCK_ADVISORY"] == "disabled"
+    assert resources["AnalyzeFunction"]["Properties"]["Environment"]["Variables"]["BEDROCK_ADVISORY"] == {"Ref": "BedrockAdvisory"}
+    assert template["Parameters"]["BedrockAdvisory"]["Default"] == "disabled"
+    assert template["Parameters"]["BedrockAdvisory"]["AllowedValues"] == ["disabled", "enabled"]
+    analyze_statements = resources["AnalyzeRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+    bedrock_actions = [action for statement in analyze_statements for action in (statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]])]
+    assert bedrock_actions.count("bedrock:InvokeModel") == 3
+    assert all(not str(action).endswith(":*") and not str(action).startswith("bedrock:*") for action in bedrock_actions)
     assert resources["SpecCheckFunction"]["Properties"]["Environment"]["Variables"]["SPEC_CHECK_MODE"] == "in-process"
     assert resources["SubmitFunction"]["Properties"]["Environment"]["Variables"]["AWS_LAMBDA_EXEC_WRAPPER"] == "/opt/otel-instrument"
     mock_paths = resources["MockApi"]["Properties"]["Body"]["paths"]

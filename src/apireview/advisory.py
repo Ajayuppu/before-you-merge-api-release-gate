@@ -107,6 +107,28 @@ def build_converse_request(model_id: str, findings: list[dict[str, str]]) -> dic
     }
 
 
+def invoke_converse(client: Any, model_id: str, findings: list[dict[str, str]]) -> dict[str, Any]:
+    """Call Converse. A transport or service error becomes a recorded non-verdict."""
+    try:
+        request = build_converse_request(model_id, findings)
+        return parse_converse_response(client.converse(**request))
+    except Exception as exc:
+        return model_call_error(exc)
+
+
+def model_call_error(exc: BaseException) -> dict[str, Any]:
+    return {
+        "source": "bedrock-converse",
+        "authoritative": False,
+        "includedInVerdict": False,
+        "explanations": [],
+        "proposals": [],
+        "modelStatus": "error",
+        "modelAdvisoryHash": None,
+        "rejection": f"{type(exc).__name__}: {exc}",
+    }
+
+
 def parse_converse_response(response: dict[str, Any]) -> dict[str, Any]:
     """Accept only a JSON object whose keys are on the allowlist."""
     try:

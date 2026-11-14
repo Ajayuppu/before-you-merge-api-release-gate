@@ -350,6 +350,21 @@ def test_model_output_cannot_change_the_verdict():
     assert request["inferenceConfig"]["maxTokens"] == 1024
     assert parse_converse_response(FakeModel().converse(**request))["modelStatus"] == "rejected"
 
+    class Unavailable:
+        def converse(self, **kwargs):
+            raise TimeoutError("model timed out")
+
+    failed = new_service(model_client=Unavailable(), model_id="us.amazon.nova-2-lite-v1:0")
+    blocked = submit(failed, BROKEN, "orders-v2-broken", "model-key-000003")
+    assert blocked["authoritativeVerdict"] == "BLOCKED"
+    report = failed.report(ada(), blocked["jobId"])
+    assert report["source"] == "deterministic-local"
+    assert "TimeoutError" in report["error"]
+    assert report["evidence"]["verdict"] == "BLOCKED"
+    assert report["evidence"]["advisory"]["includedInVerdict"] is False
+    passed = submit(new_service(model_client=Unavailable(), model_id="us.amazon.nova-2-lite-v1:0"), OLD, "orders-v1", "model-key-000004")
+    assert passed["authoritativeVerdict"] == "PASS"
+
 
 def test_checker_is_not_the_gate_and_data_channel_is_a_string_literal():
     service = new_service(checker_fn=lambda spec: {"authoritative": False, "ok": False, "findings": [{"rule": "diverge"}], "checkerVersion": "1.0.0", "checkerSourceHash": "abc", "mode": "in-process"})

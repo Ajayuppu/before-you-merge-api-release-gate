@@ -94,7 +94,7 @@ These are the pieces in the core template, `cloud/template.deploy.json`.
 - **DynamoDB.** One table, pk `JOB#`, `IDEM#`, and `OUTBOX#`. A stream on `NEW_IMAGE` feeds the publisher.
 - **S3.** Versioning enabled, public access blocked, artifacts stored at `artifacts/{sha256}.json`.
 - **EventBridge and SQS.** The rule target is the work queue. Its dead-letter queue is separate from the worker redrive queue. The work queue visibility timeout is 182 seconds, which is `6 * 30 + 2`: dispatcher timeout 30 seconds and batch window 2 seconds. Both mappings use `ReportBatchItemFailures`.
-- **Bedrock.** The analyze function builds a Converse request for `us.amazon.nova-2-lite-v1:0` and does not set `reasoningConfig`, so `maxTokens` stays valid. `BEDROCK_ADVISORY` is `disabled` in the template. The permission is present and was not used.
+- **Bedrock.** The analyze function builds a Converse request and does not set `reasoningConfig`, so `maxTokens` stays valid. `BedrockAdvisory` defaults to `disabled`. The model text is not a verdict. A call that times out or returns unparseable text leaves the deterministic advisory in place and records the source and error on the report.
 - **AgentCore.** Not in the core stack. `scripts/enable_agentcore.sh` and `cloud/agentcore/` describe a SANDBOX code interpreter, an MCP gateway with `authorizerType` `AWS_IAM`, a policy engine in `ENFORCE`, and three Cedar `permit` statements. Cedar is the `definition.cedar` union member. The Dogwood `policy` member is a different feature and is not the gate. Gateway policy is not the job binding: the tool still checks the authenticated job id.
 - **Code Interpreter.** The fixed checker runs in-process unless `SPEC_CHECK_MODE=agentcore`. SANDBOX mode can reach AWS services, including S3. That is not an air gap. `stop_code_interpreter_session` is in a `finally` block. Session timeout is the session lifetime, not the Lambda timeout. This code does not claim that stop deletes retained session data.
 - **CloudWatch and X-Ray.** Each function uses `TracingConfig` Active and the OpenTelemetry wrapper `/opt/otel-instrument`, with `OTEL_AWS_APPLICATION_SIGNALS_ENABLED=false` and `OTEL_PROPAGATORS=xray,tracecontext`. The source does not import `aws-xray-sdk`. You must pass the current regional layer ARN. This repository does not embed one, because those ARNs contain an AWS account id and change.
@@ -345,7 +345,7 @@ The script creates a code interpreter with `networkMode` `SANDBOX`, a policy eng
 
 After it exists, set the spec-check function environment `SPEC_CHECK_MODE` to `agentcore` and `CODE_INTERPRETER_ID` to the new id, then submit again. Until you do that, the template value remains `in-process`.
 
-To turn on explanations from Nova 2 Lite, set `BEDROCK_ADVISORY` to `enabled` on the analyze function. Until you do that, the deterministic explainer is the only advisory and it is still not the gate.
+To turn the optional model text on, redeploy with `BEDROCK_ADVISORY=enabled` and `BEDROCK_MODEL_ID` set to the model or inference profile id. The default model id is `us.amazon.nova-2-lite-v1:0`. Until you do that, the deterministic explainer is the only advisory and it is still not the gate. See [Compare models for the advisory step](#compare-models-for-the-advisory-step).
 
 ## What the local engine and the template each own
 
@@ -421,6 +421,35 @@ Q's documented code-review scan can skip test files. Use the chat prompts above 
 | API Gateway returns 403 | The caller is missing `execute-api:Invoke` for that method and path, or the signature does not match the region. A root user ARN is rejected. Call with `--profile api-review-developer` or `--profile api-review-reviewer`. |
 | Layer wrapper error on cold start | `OTEL_LAYER_ARN` does not match the runtime or architecture. Look up the layer again. |
 | Template deploy fails on the state machine definition | The ASL is passed through `Fn::Sub`. `scripts/assemble_template.py` doubles `$` so `$$.Task.Token` survives. Regenerate with that script rather than pasting the ASL by hand. |
+
+## Compare models for the advisory step
+
+The diff and the harness still decide `BLOCKED` or `PASS`. Bedrock text cannot change that. `scripts/compare_bedrock_models.py` calls `bedrock-runtime.converse` with the same request `build_converse_request` builds, three times per model by default. It records wall-clock latency, `usage.inputTokens`, `usage.outputTokens`, `metrics.latencyMs`, `stopReason`, and whether `parse_converse_response` accepted the reply. `AccessDeniedException`, `ValidationException`, and `ResourceNotFoundException` are stored on that model instead of stopping the run. If a model rejects the system prompt, the script folds that instruction into the user message, retries that model, and records the fallback.
+
+```bash
+python3 scripts/compare_bedrock_models.py \
+  --region "$REGION" \
+  --report ~/broken-report.json
+```
+
+`--findings` can point at a JSON list of findings instead of a report. `--models` is a comma-separated list. The default list is `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, `us.anthropic.claude-haiku-4-5-20251001-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.mistral.pixtral-large-2502-v1:0`, and `us.amazon.nova-2-lite-v1:0`. The script writes `build/model-comparison.json` and prints a markdown table plus each model's first advisory text.
+
+Switch the deployed analyze function to one of those ids and turn the call on:
+
+```bash
+CONFIRM_DEPLOY=yes \
+  REGION="$REGION" \
+  OTEL_LAYER_ARN='paste-the-layer-arn' \
+  BEDROCK_ADVISORY=enabled \
+  BEDROCK_MODEL_ID='us.amazon.nova-2-lite-v1:0' \
+  bash scripts/deploy_cloudshell.sh
+```
+
+`BedrockAdvisory` accepts only `disabled` or `enabled`. Omit it to leave the call off.
+
+### Results
+
+TO BE FILLED FROM LIVE RUN. Do not paste estimated latencies, token counts, or sample advisory text here.
 
 ## Optional cleanup
 
