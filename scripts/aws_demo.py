@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Call the deployed API review endpoint with SigV4.")
     parser.add_argument("--region", required=True)
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None)
     parser.add_argument("--stack-name", default="api-review")
     sub = parser.add_subparsers(dest="command", required=True)
     submit = sub.add_parser("submit")
@@ -37,8 +39,12 @@ def main() -> int:
     review.add_argument("--nonce", required=True)
     review.add_argument("--decision", choices=["approve", "reject"], required=True)
     review.add_argument("--comment", default="")
-    args = parser.parse_args()
-    endpoint = stack_output(args.region, args.stack_name, "ReviewApiEndpoint")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    endpoint = stack_output(args.region, args.stack_name, "ReviewApiEndpoint", args.profile)
     if args.command == "submit":
         body = {
             "fixture": json.loads(Path(args.fixture).read_text()),
@@ -46,13 +52,13 @@ def main() -> int:
             "newSpec": json.loads(Path(args.new).read_text()),
             "oldSpec": json.loads(Path(args.old).read_text()),
         }
-        return call(endpoint + "/jobs", "POST", args.region, body, {"Idempotency-Key": args.idempotency_key})
+        return call(endpoint + "/jobs", "POST", args.region, body, {"Idempotency-Key": args.idempotency_key}, args.profile)
     if args.command == "status":
-        return call(endpoint + "/jobs/" + args.job_id, "GET", args.region, None, {})
+        return call(endpoint + "/jobs/" + args.job_id, "GET", args.region, None, {}, args.profile)
     if args.command == "report":
-        return call(endpoint + "/jobs/" + args.job_id + "/report", "GET", args.region, None, {})
+        return call(endpoint + "/jobs/" + args.job_id + "/report", "GET", args.region, None, {}, args.profile)
     if args.command == "review-context":
-        return call(endpoint + "/jobs/" + args.job_id + "/review-context", "GET", args.region, None, {})
+        return call(endpoint + "/jobs/" + args.job_id + "/review-context", "GET", args.region, None, {}, args.profile)
     if args.command == "review":
         return call(
             endpoint + "/reviews",
@@ -66,29 +72,46 @@ def main() -> int:
                 "nonce": args.nonce,
             },
             {},
+            args.profile,
         )
     return 2
 
 
-def stack_output(region: str, stack_name: str, key: str) -> str:
+def stack_output(region: str, stack_name: str, key: str, profile: str | None = None) -> str:
     import boto3
+    from botocore.exceptions import ClientError
 
-    client = boto3.client("cloudformation", region_name=region)
-    stacks = client.describe_stacks(StackName=stack_name)["Stacks"]
-    for row in stacks[0].get("Outputs", []):
-        if row["OutputKey"] == key:
-            return row["OutputValue"].rstrip("/")
+    sessions = [boto3.Session(profile_name=profile)] if profile else []
+    sessions.append(boto3.Session())
+    last_denied = False
+    for index, session in enumerate(sessions):
+        try:
+            client = session.client("cloudformation", region_name=region)
+            stacks = client.describe_stacks(StackName=stack_name)["Stacks"]
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if profile and index == 0 and code in {"AccessDenied", "AccessDeniedException"}:
+                last_denied = True
+                continue
+            raise
+        if last_denied:
+            print("profile cannot read stack outputs; the lookup used ambient credentials", file=sys.stderr)
+        for row in stacks[0].get("Outputs", []):
+            if row["OutputKey"] == key:
+                return row["OutputValue"].rstrip("/")
+        raise SystemExit(f"stack output {key} was not found")
     raise SystemExit(f"stack output {key} was not found")
 
 
-def call(url: str, method: str, region: str, body: dict | None, headers: dict[str, str]) -> int:
+def call(url: str, method: str, region: str, body: dict | None, headers: dict[str, str], profile: str | None = None) -> int:
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
     from botocore.session import Session
 
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = AWSRequest(method=method, url=url, data=data, headers={"content-type": "application/json", **headers})
-    credentials = Session().get_credentials()
+    session = Session(profile=profile) if profile else Session()
+    credentials = session.get_credentials()
     if credentials is None:
         raise SystemExit("no AWS credentials in this environment")
     SigV4Auth(credentials.get_frozen_credentials(), "execute-api", region).add_auth(request)

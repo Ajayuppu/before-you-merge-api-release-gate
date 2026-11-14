@@ -28,3 +28,6 @@ if aws s3api head-bucket --bucket "$CODE_BUCKET" --region "$REGION" >/dev/null 2
   aws s3 rb "s3://${CODE_BUCKET}" --region "$REGION"
 fi
 echo "Deleted stack ${STACK} in ${REGION}."
+if [[ "${CLEANUP_IDENTITIES:-}" != "no" ]]; then
+  bash "$(cd "$(dirname "$0")" && pwd)/teardown_demo_identities.sh"
+fi

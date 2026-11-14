@@ -111,7 +111,7 @@ Removing a required response property breaks old clients. Adding a required requ
 - Python 3.11+ for the local demo.
 - `pytest` if you want the test suite (`pip install pytest`).
 - For CloudShell later: AWS CLI v2, permission to create the stack, and the current OpenTelemetry Lambda layer ARN for the region and architecture you choose. Confirm AgentCore, Bedrock Nova 2 Lite, and Step Functions are available in that region in the current AWS documentation before you start. This guide does not guess a region list.
-- Two IAM roles that can call the API: one allowed to assume `ApiReviewDeveloper`, one allowed to assume `ApiReviewReviewer`. The template names the functions so you can attach `execute-api:Invoke` on the specific method and path. Do not put the reviewer permission on the developer role.
+- Caller identities for the API. `scripts/setup_demo_identities.sh` creates IAM user `api-review-operator` and roles `ApiReviewDeveloper` and `ApiReviewReviewer`. The account root user is not an accepted caller. Do not put the reviewer permission on the developer role.
 
 ## Local demo
 
@@ -261,7 +261,9 @@ Observed `POST /jobs` for the broken candidate, with `Idempotency-Key: curl-demo
 | `cloud/template.deploy.json` | Generated CloudFormation |
 | `cloud/agentcore/` | Cedar and create-request JSON. Not created in AWS |
 | `scripts/deploy_cloudshell.sh` | Deploy. Refuses unless `CONFIRM_DEPLOY=yes` |
-| `scripts/aws_demo.py` | SigV4 workflow against a stack. Not executed here |
+| `scripts/setup_demo_identities.sh` | Operator user and the two caller roles. Refuses unless `CONFIRM_IDENTITIES=yes` |
+| `scripts/teardown_demo_identities.sh` | Removes those identities and CLI profiles |
+| `scripts/aws_demo.py` | SigV4 workflow against a stack. Accepts `--profile`. Not executed here |
 | `fixtures/` | The three orders documents, the client fixture, and mock bodies |
 
 ## CloudShell deployment
@@ -291,25 +293,31 @@ After you authorize a deployment, run:
 ```
 
 5. Read the stack outputs: `ReviewApiEndpoint`, `MockApiEndpoint`, `StateMachineArn`, `JobTableName`, `ArtifactBucketName`.
-6. Grant the developer role `execute-api:Invoke` on `POST /jobs`, `GET /jobs/*`, and `GET /jobs/*/report` of the review API. Grant the reviewer role `execute-api:Invoke` on `GET /jobs/*/review-context` and `POST /reviews`. Grant the harness role nothing extra; the template already allows the three mock GET routes.
-7. Call the API with the developer role:
+6. Create the caller identities. CloudShell runs as the account root user, and `POST /jobs` rejects that ARN. `scripts/setup_demo_identities.sh` reads `ReviewApiEndpoint` and creates IAM user `api-review-operator` (no console password) plus roles `ApiReviewDeveloper` and `ApiReviewReviewer`. The user may only call `sts:AssumeRole` on those two roles. The developer role may invoke `POST /jobs` and `GET /jobs/*` (which covers `GET /jobs/*/report`) and is denied `GET /jobs/*/review-context` and `POST /reviews`. The reviewer role may invoke only those two reviewer routes. The script writes CLI profiles `api-review-operator`, `api-review-developer` (session name `dev-ada`), and `api-review-reviewer` (session name `rev-ben`). It does not print the secret key. Rerunning it updates the role trust and inline policies in place. The harness role needs nothing extra; the template already allows the three mock GET routes.
 
 ```bash
-python3 scripts/aws_demo.py --region "$REGION" submit \
+CONFIRM_IDENTITIES=yes REGION="$REGION" bash scripts/setup_demo_identities.sh
+```
+
+Without `CONFIRM_IDENTITIES=yes` the script exits 2.
+7. Call the API with the developer profile. `--profile` is passed to the stack lookup and to the signed call. These roles are not granted CloudFormation access. When the profile cannot read the stack, the lookup uses the ambient credentials and the profile still signs the request.
+
+```bash
+python3 scripts/aws_demo.py --region "$REGION" --profile api-review-developer submit \
   --old fixtures/orders-v1.openapi.json \
   --new fixtures/orders-v2-broken.openapi.json \
   --fixture fixtures/orders-client.fixture.json \
   --mock-version orders-v2-broken \
   --idempotency-key cloud-broken-0001
-python3 scripts/aws_demo.py --region "$REGION" status --job-id "$JOB_ID"
-python3 scripts/aws_demo.py --region "$REGION" report --job-id "$JOB_ID"
+python3 scripts/aws_demo.py --region "$REGION" --profile api-review-developer status --job-id "$JOB_ID"
+python3 scripts/aws_demo.py --region "$REGION" --profile api-review-developer report --job-id "$JOB_ID"
 ```
 
-8. Repeat submit with `orders-v2-corrected.openapi.json`, mock version `orders-v2-corrected`, and a new idempotency key. Assume the reviewer role and run:
+8. Repeat submit with `orders-v2-corrected.openapi.json`, mock version `orders-v2-corrected`, and a new idempotency key. Use the reviewer profile:
 
 ```bash
-python3 scripts/aws_demo.py --region "$REGION" review-context --job-id "$JOB_ID"
-python3 scripts/aws_demo.py --region "$REGION" review \
+python3 scripts/aws_demo.py --region "$REGION" --profile api-review-reviewer review-context --job-id "$JOB_ID"
+python3 scripts/aws_demo.py --region "$REGION" --profile api-review-reviewer review \
   --job-id "$JOB_ID" \
   --evidence-hash "$EVIDENCE_HASH" \
   --nonce "$NONCE" \
@@ -410,7 +418,7 @@ Q's documented code-review scan can skip test files. Use the chat prompts above 
 | Second review returns `already-consumed` and the job is still `REVIEW_CALLBACK_PENDING` | The callback was sent and finalize has not written the terminal status. Inspect the execution. Do not mark the job approved by hand. |
 | Harness Lambda fails closed with `signed mock transport is not attached` | The process is not the Lambda runtime. Local tests pass an in-process transport on purpose. |
 | `enable_agentcore.sh` cannot find `policyEngineArn` | Print the create-policy-engine JSON and use the ARN field the service returned. The script was not executed against AWS here. |
-| API Gateway returns 403 | The caller is missing `execute-api:Invoke` for that method and path, or the signature does not match the region. |
+| API Gateway returns 403 | The caller is missing `execute-api:Invoke` for that method and path, or the signature does not match the region. A root user ARN is rejected. Call with `--profile api-review-developer` or `--profile api-review-reviewer`. |
 | Layer wrapper error on cold start | `OTEL_LAYER_ARN` does not match the runtime or architecture. Look up the layer again. |
 | Template deploy fails on the state machine definition | The ASL is passed through `Fn::Sub`. `scripts/assemble_template.py` doubles `$` so `$$.Task.Token` survives. Regenerate with that script rather than pasting the ASL by hand. |
 
@@ -422,7 +430,7 @@ Only when you intend to remove the stack:
 CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/cleanup_cloudshell.sh
 ```
 
-The script empties the artifact bucket and the code bucket, deletes the stack, and removes the code bucket. Without `CONFIRM_CLEANUP=yes` it exits 2. That refusal was observed in this session. It does not delete the AgentCore gateway or code interpreter if you created them with the optional script. Delete those with the matching `bedrock-agentcore-control` delete operations if you created them.
+The script empties the artifact bucket and the code bucket, deletes the stack, and removes the code bucket. It then runs `scripts/teardown_demo_identities.sh`, which deletes the operator user, both caller roles, and the three CLI profiles. Set `CLEANUP_IDENTITIES=no` to leave those identities in place. Without `CONFIRM_CLEANUP=yes` it exits 2. That refusal was observed in this session. It does not delete the AgentCore gateway or code interpreter if you created them with the optional script. Delete those with the matching `bedrock-agentcore-control` delete operations if you created them.
 
 ## Gaps
 
