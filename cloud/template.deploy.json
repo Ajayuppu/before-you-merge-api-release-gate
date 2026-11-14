@@ -388,6 +388,15 @@
                 },
                 {
                   "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"
+                  }
+                },
+                {
+                  "Action": [
                     "states:SendTaskSuccess"
                   ],
                   "Effect": "Allow",

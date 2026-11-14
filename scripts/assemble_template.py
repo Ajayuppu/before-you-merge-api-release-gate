@@ -252,6 +252,7 @@ def build_template() -> dict:
     resources["ReviewRole"] = role(
         [
             {"Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"], "Effect": "Allow", "Resource": table_arn},
+            {"Action": ["s3:GetObject"], "Effect": "Allow", "Resource": {"Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"}},
             {
                 "Action": ["states:SendTaskSuccess"],
                 "Effect": "Allow",

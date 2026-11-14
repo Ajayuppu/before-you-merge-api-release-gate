@@ -1,7 +1,7 @@
 """Local reference implementation of the API change reviewer.
 
-The package runs without AWS credentials. Cloud adapters live beside it and are
-not invoked unless a caller explicitly constructs them.
+Importing the package does not contact AWS. Handlers build SDK clients only
+when they run inside Lambda and the caller did not inject one.
 """
 
 __version__ = "1.0.0"

@@ -1,7 +1,8 @@
 """API Gateway, queue, and Step Functions handlers.
 
-Inject clients in tests. The default path raises FailClosed instead of creating
-boto3 clients, so importing this module does not contact AWS.
+Inject clients in tests. Outside Lambda, a missing client raises FailClosed
+instead of creating SDK clients, so importing this module does not contact AWS.
+Inside Lambda, a missing client is built on first use and then reused.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ class BlobStore:
 
 def submit_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, blobs = _require_resources(table, blobs)
+    table, blobs = _require_resources(table, blobs, settings)
     try:
         principal = principal_from_api_gateway(event, expected_role_name=DEVELOPER_ROLE_NAME, simulation_account_allowed=settings.simulation_identity)
         body = _json_body(event)
@@ -159,7 +160,7 @@ def submit_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
 
 def status_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, _blobs = _require_resources(table, blobs)
+    table, _blobs = _require_resources(table, blobs, settings)
     try:
         principal = principal_from_api_gateway(event, expected_role_name=DEVELOPER_ROLE_NAME, simulation_account_allowed=settings.simulation_identity)
         job = _require(table, _path_job_id(event))
@@ -176,7 +177,7 @@ def status_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
 
 def review_context_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, _blobs = _require_resources(table, blobs)
+    table, _blobs = _require_resources(table, blobs, settings)
     try:
         principal = principal_from_api_gateway(event, expected_role_name=REVIEWER_ROLE_NAME, simulation_account_allowed=settings.simulation_identity)
         job = _require(table, _path_job_id(event))
@@ -201,7 +202,7 @@ def review_context_handler(event: dict[str, Any], context: Any = None, table: Do
 
 def review_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None, sfn: Any = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, blobs = _require_resources(table, blobs)
+    table, blobs = _require_resources(table, blobs, settings)
     try:
         principal = principal_from_api_gateway(event, expected_role_name=REVIEWER_ROLE_NAME, simulation_account_allowed=settings.simulation_identity)
         body = _json_body(event)
@@ -235,6 +236,10 @@ def review_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
             )
         elif job.get("reviewer") != principal.subject or job.get("decision") != decision:
             raise FailClosed("replay rejected")
+        if sfn is None and _in_lambda():
+            from apireview import runtime_clients
+
+            sfn = runtime_clients.stepfunctions_client()
         if sfn is None:
             raise FailClosed("step functions client is not configured")
         output = {"decision": decision, "evidenceHash": job["evidenceHash"], "jobId": job["jobId"], "nonce": job["reviewNonce"], "reviewer": principal.subject}
@@ -251,7 +256,11 @@ def review_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
 
 def publisher_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None, events_client: Any = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, _blobs = _require_resources(table, blobs)
+    table, _blobs = _require_resources(table, blobs, settings)
+    if events_client is None and _in_lambda():
+        from apireview import runtime_clients
+
+        events_client = runtime_clients.events_client()
     if events_client is None:
         raise FailClosed("event bridge client is not configured")
     failures: list[dict[str, str]] = []
@@ -282,7 +291,11 @@ def publisher_handler(event: dict[str, Any], context: Any = None, table: Documen
 
 def dispatcher_handler(event: dict[str, Any], context: Any = None, table: DocumentTable | None = None, blobs: BlobStore | None = None, settings: Settings | None = None, sfn: Any = None) -> dict[str, Any]:
     settings = settings or settings_from_env()
-    table, _blobs = _require_resources(table, blobs)
+    table, _blobs = _require_resources(table, blobs, settings)
+    if sfn is None and _in_lambda():
+        from apireview import runtime_clients
+
+        sfn = runtime_clients.stepfunctions_client()
     failures = []
     for record in event.get("Records") or []:
         try:
@@ -323,6 +336,10 @@ def analyze_handler(event: dict[str, Any], context: Any = None, table: DocumentT
     advisory = deterministic_advisory(job["findings"])
     model_result = None
     if settings.bedrock_advisory == "enabled":
+        if bedrock is None and _in_lambda():
+            from apireview import runtime_clients
+
+            bedrock = runtime_clients.bedrock_runtime_client()
         if bedrock is None:
             raise FailClosed("Bedrock advisory is enabled but no client was provided")
         request = build_converse_request(settings.bedrock_model_id, job["findings"])
@@ -352,6 +369,10 @@ def spec_check_handler(event: dict[str, Any], context: Any = None, table: Docume
     job = _require(table, event["jobId"])
     candidate = blobs.get_json(job["newSpecHash"])
     if settings.spec_check_mode == "agentcore":
+        if interpreter is None and _in_lambda():
+            from apireview import runtime_clients
+
+            interpreter = runtime_clients.code_interpreter_client()
         if interpreter is None or not settings.code_interpreter_id:
             raise FailClosed("AgentCore mode is enabled but the interpreter is not configured")
         checker = run_code_interpreter(interpreter, interpreter_id=settings.code_interpreter_id, candidate_spec=candidate)
@@ -528,16 +549,29 @@ def _recheck(job: dict[str, Any], blobs: BlobStore) -> None:
         raise FailClosed("sealed evidence does not match stored result bytes")
 
 
+def _in_lambda() -> bool:
+    return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
 def _ready(table: DocumentTable | None, blobs: BlobStore | None, settings: Settings | None) -> tuple[Settings, DocumentTable, BlobStore]:
     settings = settings or settings_from_env()
-    table, blobs = _require_resources(table, blobs)
+    table, blobs = _require_resources(table, blobs, settings)
     return settings, table, blobs
 
 
-def _require_resources(table: DocumentTable | None, blobs: BlobStore | None) -> tuple[DocumentTable, BlobStore]:
-    if table is None or blobs is None:
-        raise FailClosed("AWS clients are not configured in this process")
-    return table, blobs
+def _require_resources(table: DocumentTable | None, blobs: BlobStore | None, settings: Settings | None = None) -> tuple[DocumentTable, BlobStore]:
+    if table is not None and blobs is not None:
+        return table, blobs
+    if _in_lambda():
+        from apireview import runtime_clients
+
+        settings = settings or settings_from_env()
+        if table is None:
+            table = runtime_clients.document_table(settings)
+        if blobs is None:
+            blobs = runtime_clients.blob_store(settings)
+        return table, blobs
+    raise FailClosed("AWS clients are not configured in this process")
 
 
 def _json_body(event: dict[str, Any]) -> dict[str, Any]:
