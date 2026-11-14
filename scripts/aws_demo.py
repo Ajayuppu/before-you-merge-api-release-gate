@@ -52,13 +52,17 @@ def main() -> int:
             "newSpec": json.loads(Path(args.new).read_text()),
             "oldSpec": json.loads(Path(args.old).read_text()),
         }
-        return call(endpoint + "/jobs", "POST", args.region, body, {"Idempotency-Key": args.idempotency_key}, args.profile)
+        code, text = call(endpoint + "/jobs", "POST", args.region, body, {"Idempotency-Key": args.idempotency_key}, args.profile)
+        if code == 0:
+            remember_job(text)
+        return code
+    job_id = resolve_job_id(args.job_id)
     if args.command == "status":
-        return call(endpoint + "/jobs/" + args.job_id, "GET", args.region, None, {}, args.profile)
+        return call(endpoint + "/jobs/" + job_id, "GET", args.region, None, {}, args.profile)[0]
     if args.command == "report":
-        return call(endpoint + "/jobs/" + args.job_id + "/report", "GET", args.region, None, {}, args.profile)
+        return call(endpoint + "/jobs/" + job_id + "/report", "GET", args.region, None, {}, args.profile)[0]
     if args.command == "review-context":
-        return call(endpoint + "/jobs/" + args.job_id + "/review-context", "GET", args.region, None, {}, args.profile)
+        return call(endpoint + "/jobs/" + job_id + "/review-context", "GET", args.region, None, {}, args.profile)[0]
     if args.command == "review":
         return call(
             endpoint + "/reviews",
@@ -68,13 +72,35 @@ def main() -> int:
                 "comment": args.comment,
                 "decision": args.decision,
                 "evidenceHash": args.evidence_hash,
-                "jobId": args.job_id,
+                "jobId": job_id,
                 "nonce": args.nonce,
             },
             {},
             args.profile,
-        )
+        )[0]
     return 2
+
+
+def resolve_job_id(job_id: str) -> str:
+    if job_id != "last":
+        return job_id
+    path = Path.home() / ".api-review-last-job"
+    if not path.is_file():
+        raise SystemExit(f"no saved job id in {path}")
+    saved = path.read_text(encoding="utf-8").strip()
+    if not saved:
+        raise SystemExit(f"saved job id in {path} is empty")
+    return saved
+
+
+def remember_job(body: str) -> None:
+    try:
+        job_id = json.loads(body).get("jobId")
+    except json.JSONDecodeError:
+        return
+    if isinstance(job_id, str) and job_id:
+        path = Path.home() / ".api-review-last-job"
+        path.write_text(job_id + "\n", encoding="utf-8")
 
 
 def stack_output(region: str, stack_name: str, key: str, profile: str | None = None) -> str:
@@ -103,7 +129,7 @@ def stack_output(region: str, stack_name: str, key: str, profile: str | None = N
     raise SystemExit(f"stack output {key} was not found")
 
 
-def call(url: str, method: str, region: str, body: dict | None, headers: dict[str, str], profile: str | None = None) -> int:
+def call(url: str, method: str, region: str, body: dict | None, headers: dict[str, str], profile: str | None = None) -> tuple[int, str]:
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
     from botocore.session import Session
@@ -118,11 +144,13 @@ def call(url: str, method: str, region: str, body: dict | None, headers: dict[st
     outbound = urllib.request.Request(url, data=data, method=method, headers=dict(request.headers.items()))
     try:
         with urllib.request.urlopen(outbound, timeout=30) as response:
-            print(response.read().decode("utf-8"))
-            return 0
+            text = response.read().decode("utf-8")
+            print(text)
+            return 0, text
     except urllib.error.HTTPError as exc:
-        print(exc.read().decode("utf-8"), file=sys.stderr)
-        return 1
+        text = exc.read().decode("utf-8")
+        print(text, file=sys.stderr)
+        return 1, text
 
 
 if __name__ == "__main__":

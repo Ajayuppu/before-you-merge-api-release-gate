@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from apireview.advisory import deterministic_advisory, invoke_converse, merge_advisory
+from apireview.advisory import deterministic_advisory, invoke_converse, merge_advisory, report_advisory
 from apireview.agent_boundary import TrustedContext, ToolGateway, run_bounded_agent
 from apireview.aws_calls import publish_events, run_code_interpreter, start_or_reconcile
 from apireview.aws_dynamo import DocumentTable, dynamodb_number, error_code, loads_document
@@ -170,7 +170,18 @@ def status_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
         if str(event.get("path", "")).endswith("/report"):
             if not job.get("evidence"):
                 raise FailClosed("report is not sealed yet")
-            return _response(200, {"advisory": _advisory_report(job.get("advisory")), "evidence": job["evidence"], "job": _public_job(job)})
+            return _response(
+                200,
+                {
+                    "advisory": report_advisory(
+                        job.get("advisory"),
+                        enabled=settings.bedrock_advisory == "enabled",
+                        model_id=settings.bedrock_model_id,
+                    ),
+                    "evidence": job["evidence"],
+                    "job": _public_job(job),
+                },
+            )
         return _response(200, _public_job(job))
     except ReviewError as exc:
         return _response(exc.http_status, {"error": exc.code, "message": str(exc)})
@@ -344,7 +355,10 @@ def analyze_handler(event: dict[str, Any], context: Any = None, table: DocumentT
         if bedrock is None:
             raise FailClosed("Bedrock advisory is enabled but no client was provided")
         model_result = invoke_converse(bedrock, settings.bedrock_model_id, job["findings"])
-    advisory = merge_advisory(advisory, model_result)
+        advisory = merge_advisory(advisory, model_result, model_id=settings.bedrock_model_id)
+    else:
+        advisory = merge_advisory(advisory, None)
+        advisory["modelStatus"] = "disabled"
     trace = run_bounded_agent(
         ToolGateway(
             {
@@ -604,17 +618,6 @@ def _response(status: int, payload: dict[str, Any]) -> dict[str, Any]:
         "body": json.dumps(payload, sort_keys=True, default=_json_default),
         "headers": {"content-type": "application/json"},
         "statusCode": status,
-    }
-
-
-def _advisory_report(advisory: dict[str, Any] | None) -> dict[str, Any]:
-    advisory = advisory or {}
-    return {
-        "authoritative": False,
-        "error": advisory.get("error") if advisory.get("error") is not None else advisory.get("modelRejection"),
-        "includedInVerdict": False,
-        "modelStatus": advisory.get("modelStatus"),
-        "source": advisory.get("source"),
     }
 
 

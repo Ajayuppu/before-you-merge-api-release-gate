@@ -376,13 +376,17 @@ def _safe_tree(value: Any) -> bool:
     return isinstance(value, (int, float, bool)) or value is None
 
 
-def merge_advisory(deterministic: dict[str, Any], model: dict[str, Any] | None) -> dict[str, Any]:
+def merge_advisory(deterministic: dict[str, Any], model: dict[str, Any] | None, model_id: str | None = None) -> dict[str, Any]:
+    """Keep the deterministic explanations used by the seal hash, and attach the model text beside them."""
     merged = dict(deterministic)
     merged["authoritative"] = False
     merged["includedInVerdict"] = False
+    merged["modelId"] = model_id
     if model is None:
         merged["modelStatus"] = "not-called"
         merged["modelAdvisoryHash"] = None
+        merged["modelRejection"] = None
+        merged["error"] = None
         return merged
     merged["modelStatus"] = model.get("modelStatus")
     merged["modelAdvisoryHash"] = model.get("modelAdvisoryHash")
@@ -392,6 +396,51 @@ def merge_advisory(deterministic: dict[str, Any], model: dict[str, Any] | None) 
     merged["modelRejection"] = reason
     merged["error"] = reason
     if model.get("modelStatus") == "parsed":
+        merged["modelSource"] = "bedrock-converse"
         merged["modelExplanations"] = model.get("explanations", [])
         merged["modelProposals"] = model.get("proposals", [])
     return merged
+
+
+def report_advisory(advisory: dict[str, Any] | None, *, enabled: bool, model_id: str | None = None) -> dict[str, Any]:
+    """Shape the report. Model text is never a verdict."""
+    advisory = advisory or {}
+    status = advisory.get("modelStatus")
+    if not enabled or status == "disabled":
+        return {
+            "authoritative": False,
+            "error": None,
+            "explanations": advisory.get("explanations", []),
+            "includedInVerdict": False,
+            "modelAdvisoryHash": None,
+            "modelId": None,
+            "modelStatus": "disabled",
+            "proposals": advisory.get("proposals", []),
+            "source": "deterministic-local",
+        }
+    if status == "parsed":
+        return {
+            "authoritative": False,
+            "error": None,
+            "explanations": advisory.get("modelExplanations", []),
+            "includedInVerdict": False,
+            "modelAdvisoryHash": advisory.get("modelAdvisoryHash"),
+            "modelId": advisory.get("modelId") or model_id,
+            "modelStatus": "parsed",
+            "proposals": advisory.get("modelProposals", []),
+            "source": advisory.get("modelSource") or "bedrock-converse",
+        }
+    reason = advisory.get("error")
+    if reason is None:
+        reason = advisory.get("modelRejection")
+    return {
+        "authoritative": False,
+        "error": reason,
+        "explanations": advisory.get("explanations", []),
+        "includedInVerdict": False,
+        "modelAdvisoryHash": advisory.get("modelAdvisoryHash"),
+        "modelId": advisory.get("modelId") or model_id,
+        "modelStatus": status or "not-called",
+        "proposals": advisory.get("proposals", []),
+        "source": "deterministic-local",
+    }

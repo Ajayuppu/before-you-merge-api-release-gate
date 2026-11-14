@@ -369,11 +369,14 @@ class ReviewService:
         if not job.get("evidence"):
             raise FailClosed("report is not sealed yet")
         self._recheck_evidence(job)
-        stored = job.get("advisory") or {}
+        from apireview.advisory import report_advisory
+
+        stored = report_advisory(job.get("advisory"), enabled=self.model_client is not None, model_id=self.model_id)
         return {
+            "advisory": stored,
             "advisoryAuthoritative": False,
             "checkerAuthoritative": False,
-            "error": stored.get("error") if stored.get("error") is not None else stored.get("modelRejection"),
+            "error": stored.get("error"),
             "evidence": job["evidence"],
             "explanations": stored.get("explanations", []),
             "job": self.public_job(job, principal),
@@ -459,7 +462,7 @@ class ReviewService:
             from apireview.advisory import invoke_converse
 
             model_result = invoke_converse(self.model_client, self.model_id, job["findings"])
-        advisory = merge_advisory(advisory, model_result)
+        advisory = merge_advisory(advisory, model_result, model_id=self.model_id if model_result is not None else None)
         trace = self._agent_trace(job)
         self._transition(
             job_id,

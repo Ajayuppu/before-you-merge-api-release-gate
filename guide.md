@@ -450,6 +450,16 @@ CONFIRM_DEPLOY=yes \
 
 `BedrockAdvisory` accepts only `disabled` or `enabled`. Omit it to leave the call off.
 
+After the deploy, read the analyze function environment. This does not change the stack:
+
+```bash
+aws lambda get-function-configuration \
+  --function-name api-review-analyze \
+  --query Environment.Variables
+```
+
+`BEDROCK_ADVISORY` should be `enabled` and `BEDROCK_MODEL_ID` the id you passed. `python3 scripts/aws_demo.py` writes the submitted job id to `~/.api-review-last-job`. Later commands accept `--job-id last`.
+
 ### Results
 
 TO BE FILLED FROM LIVE RUN. Do not paste estimated latencies, token counts, or sample advisory text here.
