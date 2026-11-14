@@ -21,14 +21,37 @@ if str(ROOT / "src") not in sys.path:
 STATE_PATH = ROOT / "build" / "agentcore-ids.json"
 INTERPRETER_ROLE = "ApiReviewCodeInterpreter"
 GATEWAY_ROLE = "ApiReviewGateway"
-INTERPRETER_NAME = "api-review-checker"
-GATEWAY_NAME = "api-review-tools"
+INTERPRETER_NAME = "ApiReviewChecker"
+GATEWAY_NAME = "ApiReviewTools"
 ENGINE_NAME = "ApiReviewPolicy"
 TARGET_NAME = "ReviewTools"
+POLICY_NAMES = ("AllowReadArtifacts", "AllowRequestSpecCheck", "AllowReadTestResults")
+SESSION_NAME = "ApiReviewValidate"
 TAG_KEY = "api-review"
 TAG_VALUE = "agentcore"
 READ_TOOL = "ReviewTools___read_artifacts"
 APPROVE_TOOL = "ReviewTools___approve"
+
+# Documented name constraints:
+# CreateCodeInterpreter: [a-zA-Z][a-zA-Z0-9_]{0,47}
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateCodeInterpreter.html
+# CreateGateway: ([0-9a-zA-Z][-]?){1,48}
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateGateway.html
+# CreateGatewayTarget: ([0-9a-zA-Z][-]?){1,100}
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateGatewayTarget.html
+# CreatePolicyEngine and CreatePolicy: [A-Za-z][A-Za-z0-9_]* with length 1-48
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreatePolicyEngine.html
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreatePolicy.html
+NAME_PATTERNS = {
+    "code_interpreter": (INTERPRETER_NAME, r"[a-zA-Z][a-zA-Z0-9_]{0,47}"),
+    "gateway": (GATEWAY_NAME, r"([0-9a-zA-Z][-]?){1,48}"),
+    "gateway_target": (TARGET_NAME, r"([0-9a-zA-Z][-]?){1,100}"),
+    "policy_engine": (ENGINE_NAME, r"[A-Za-z][A-Za-z0-9_]{0,47}"),
+    "policy_read_artifacts": (POLICY_NAMES[0], r"[A-Za-z][A-Za-z0-9_]{0,47}"),
+    "policy_request_spec_check": (POLICY_NAMES[1], r"[A-Za-z][A-Za-z0-9_]{0,47}"),
+    "policy_read_test_results": (POLICY_NAMES[2], r"[A-Za-z][A-Za-z0-9_]{0,47}"),
+    "session": (SESSION_NAME, r"[a-zA-Z][a-zA-Z0-9_]{0,47}"),
+}
 
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-session-management.html
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-prerequisites-permissions.html
@@ -310,7 +333,7 @@ def _validate_interpreter(region: str, state: dict[str, str]) -> int:
     try:
         started = client.start_code_interpreter_session(
             codeInterpreterIdentifier=interpreter_id,
-            name="api-review-validate",
+            name=SESSION_NAME,
             sessionTimeoutSeconds=120,
         )
         session_id = started["sessionId"]
@@ -437,49 +460,76 @@ def _ensure_role(iam, name: str, trust: dict[str, Any], policy: dict[str, Any] |
 
 
 def _ensure_interpreter(control, role_arn: str) -> str:
-    for item in _items(control.list_code_interpreters(), "codeInterpreters", "codeInterpreterSummaries"):
-        if item.get("name") == INTERPRETER_NAME:
-            print(f"Code interpreter {INTERPRETER_NAME} already exists.")
-            return item["codeInterpreterId"]
-    response = retry_iam(
-        lambda: control.create_code_interpreter(
-            name=INTERPRETER_NAME,
-            description="Fixed specification checker. SANDBOX is not an air gap.",
-            executionRoleArn=role_arn,
-            networkConfiguration={"networkMode": "SANDBOX"},
-            tags={TAG_KEY: TAG_VALUE},
-        ),
-        "create code interpreter",
-    )
+    existing = _named_id(control.list_code_interpreters, ("codeInterpreters", "codeInterpreterSummaries"), INTERPRETER_NAME, "codeInterpreterId")
+    if existing:
+        print(f"Code interpreter {INTERPRETER_NAME} already exists.")
+        return existing
+    try:
+        response = retry_iam(
+            lambda: control.create_code_interpreter(
+                name=INTERPRETER_NAME,
+                description="Fixed specification checker. SANDBOX is not an air gap.",
+                executionRoleArn=role_arn,
+                networkConfiguration={"networkMode": "SANDBOX"},
+                tags={TAG_KEY: TAG_VALUE},
+            ),
+            "create code interpreter",
+        )
+    except Exception as exc:
+        if not _is_conflict(exc):
+            raise
+        existing = _named_id(control.list_code_interpreters, ("codeInterpreters", "codeInterpreterSummaries"), INTERPRETER_NAME, "codeInterpreterId")
+        if not existing:
+            raise
+        print(f"Code interpreter {INTERPRETER_NAME} already exists.")
+        return existing
     return response["codeInterpreterId"]
 
 
 def _ensure_engine(control) -> dict[str, str]:
-    for item in _items(control.list_policy_engines(), "policyEngines", "policyEngineSummaries"):
-        if item.get("name") == ENGINE_NAME:
-            print(f"Policy engine {ENGINE_NAME} already exists.")
-            return {"id": item["policyEngineId"], "arn": item.get("policyEngineArn") or item.get("arn")}
-    response = control.create_policy_engine(name=ENGINE_NAME, description="Read-only tools for the API review gateway.", tags={TAG_KEY: TAG_VALUE})
+    found = _named_record(control.list_policy_engines, ("policyEngines", "policyEngineSummaries"), ENGINE_NAME, "policyEngineId", "policyEngineArn")
+    if found:
+        print(f"Policy engine {ENGINE_NAME} already exists.")
+        return found
+    try:
+        response = control.create_policy_engine(name=ENGINE_NAME, description="Read-only tools for the API review gateway.", tags={TAG_KEY: TAG_VALUE})
+    except Exception as exc:
+        if not _is_conflict(exc):
+            raise
+        found = _named_record(control.list_policy_engines, ("policyEngines", "policyEngineSummaries"), ENGINE_NAME, "policyEngineId", "policyEngineArn")
+        if not found:
+            raise
+        print(f"Policy engine {ENGINE_NAME} already exists.")
+        return found
     return {"id": response["policyEngineId"], "arn": response.get("policyEngineArn") or response.get("arn")}
 
 
 def _ensure_gateway(control, role_arn: str, engine_arn: str) -> dict[str, str]:
-    for item in _items(control.list_gateways(), "gateways", "gatewaySummaries"):
-        if item.get("name") == GATEWAY_NAME:
-            print(f"Gateway {GATEWAY_NAME} already exists.")
-            return {"id": item["gatewayId"], "arn": item.get("gatewayArn") or item.get("arn"), "url": item.get("gatewayUrl") or ""}
-    response = retry_iam(
-        lambda: control.create_gateway(
-            name=GATEWAY_NAME,
-            description="MCP gateway for the three read-only review tools.",
-            authorizerType="AWS_IAM",
-            protocolType="MCP",
-            roleArn=role_arn,
-            policyEngineConfiguration={"arn": engine_arn, "mode": "ENFORCE"},
-            tags={TAG_KEY: TAG_VALUE},
-        ),
-        "create gateway",
-    )
+    found = _named_record(control.list_gateways, ("gateways", "gatewaySummaries"), GATEWAY_NAME, "gatewayId", "gatewayArn", "gatewayUrl")
+    if found:
+        print(f"Gateway {GATEWAY_NAME} already exists.")
+        return found
+    try:
+        response = retry_iam(
+            lambda: control.create_gateway(
+                name=GATEWAY_NAME,
+                description="MCP gateway for the three read-only review tools.",
+                authorizerType="AWS_IAM",
+                protocolType="MCP",
+                roleArn=role_arn,
+                policyEngineConfiguration={"arn": engine_arn, "mode": "ENFORCE"},
+                tags={TAG_KEY: TAG_VALUE},
+            ),
+            "create gateway",
+        )
+    except Exception as exc:
+        if not _is_conflict(exc):
+            raise
+        found = _named_record(control.list_gateways, ("gateways", "gatewaySummaries"), GATEWAY_NAME, "gatewayId", "gatewayArn", "gatewayUrl")
+        if not found:
+            raise
+        print(f"Gateway {GATEWAY_NAME} already exists.")
+        return found
     return {"id": response["gatewayId"], "arn": response["gatewayArn"], "url": response.get("gatewayUrl", "")}
 
 
@@ -490,7 +540,8 @@ def _ensure_target(control, gateway_id: str, api_id: str) -> None:
         if item.get("name") == TARGET_NAME:
             print(f"Gateway target {TARGET_NAME} already exists.")
             return
-    control.create_gateway_target(
+    try:
+        control.create_gateway_target(
         gatewayIdentifier=gateway_id,
         name=TARGET_NAME,
         description="Review API routes. Approve is exposed so policy can deny it.",
@@ -505,6 +556,10 @@ def _ensure_target(control, gateway_id: str, api_id: str) -> None:
         },
         credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
     )
+    except Exception as exc:
+        if not _is_conflict(exc):
+            raise
+        print(f"Gateway target {TARGET_NAME} already exists.")
 
 
 def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
@@ -513,7 +568,11 @@ def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
         ("AllowRequestSpecCheck", ROOT / "cloud/agentcore/allow-request-spec-check.cedar"),
         ("AllowReadTestResults", ROOT / "cloud/agentcore/allow-read-test-results.cedar"),
     ]
+    existing = {item.get("name") for item in _items(control.list_policies(policyEngineId=engine_id), "policies", "policySummaries")}
     for name, path in files:
+        if name in existing:
+            print(f"Policy {name} already exists.")
+            continue
         statement = path.read_text(encoding="utf-8").replace("__GATEWAY_ARN__", gateway_arn)
         try:
             control.create_policy(
@@ -524,7 +583,7 @@ def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
                 definition={"cedar": {"statement": statement}},
             )
         except Exception as exc:
-            if "Conflict" not in type(exc).__name__ and "already" not in str(exc).lower():
+            if not _is_conflict(exc):
                 raise
 
 
@@ -543,6 +602,28 @@ def _wait_ready(reader, label: str) -> None:
             raise SystemExit(f"{label} entered {status}")
         time.sleep(5)
     raise SystemExit(f"{label} was not ready")
+
+
+def _is_conflict(exc: BaseException) -> bool:
+    return "Conflict" in type(exc).__name__ or "already" in str(exc).lower()
+
+
+def _named_id(lister, keys: tuple[str, ...], name: str, id_key: str) -> str:
+    for item in _items(lister(), *keys):
+        if item.get("name") == name and item.get(id_key):
+            return item[id_key]
+    return ""
+
+
+def _named_record(lister, keys: tuple[str, ...], name: str, id_key: str, arn_key: str, url_key: str = "") -> dict[str, str] | None:
+    for item in _items(lister(), *keys):
+        if item.get("name") != name:
+            continue
+        found = {"id": item.get(id_key) or "", "arn": item.get(arn_key) or item.get("arn") or ""}
+        if url_key:
+            found["url"] = item.get(url_key) or ""
+        return found
+    return None
 
 
 def _items(response: dict[str, Any], *keys: str) -> list[dict[str, Any]]:

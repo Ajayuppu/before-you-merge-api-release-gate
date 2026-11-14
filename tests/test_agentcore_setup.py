@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 
+import re
+
 from scripts.agentcore_setup import (
     APPROVE_TOOL,
+    NAME_PATTERNS,
     READ_TOOL,
     SERVICE_PRINCIPAL,
     classify_tool_result,
@@ -13,6 +16,22 @@ from scripts.agentcore_setup import (
     tool_configuration,
     trust_policy,
 )
+
+
+def test_resource_names_match_documented_patterns():
+    assert set(NAME_PATTERNS) == {
+        "code_interpreter",
+        "gateway",
+        "gateway_target",
+        "policy_engine",
+        "policy_read_artifacts",
+        "policy_request_spec_check",
+        "policy_read_test_results",
+        "session",
+    }
+    for label, (name, pattern) in NAME_PATTERNS.items():
+        assert re.fullmatch(pattern, name), label
+        assert "-" not in name or label in {"gateway", "gateway_target"}
 
 
 def test_trust_uses_the_agentcore_service_principal():
