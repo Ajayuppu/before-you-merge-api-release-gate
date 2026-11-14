@@ -337,13 +337,13 @@ The core path does not need it. If you want the SANDBOX interpreter and the gate
 CONFIRM_AGENTCORE=yes REGION=us-east-1 bash scripts/enable_agentcore.sh
 ```
 
-The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those role ARNs are not already set. Both trust `bedrock-agentcore.amazonaws.com`, limited by `aws:SourceAccount` and `aws:SourceArn`. It tags them `api-review=agentcore`. It then creates a SANDBOX code interpreter, a policy engine, an IAM-authorized MCP gateway in `ENFORCE`, a Review API target, and the three Cedar permits. There is no permit for `approve`. Without `CONFIRM_AGENTCORE=yes` it exits 2.
+The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those role ARNs are not already set. Both trust `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` and `aws:SourceArn` set to `arn:aws:bedrock-agentcore:REGION:ACCOUNT:*`. The gateway role stays on that account wildcard: CreateGateway assumes it to validate the policy engine, and a gateway-only ARN does not match that check. It tags them `api-review=agentcore`. It reuses an existing gateway (ListGateways returns `items`; the id is the lowercased name plus a suffix) and attaches the policy engine if needed. It then creates a SANDBOX code interpreter, a policy engine, an IAM-authorized MCP gateway in `ENFORCE`, a Review API target, and the three Cedar permits. It waits until the target status is `READY`. There is no permit for `approve`. Without `CONFIRM_AGENTCORE=yes` it exits 2.
 
 ```bash
 CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh
 ```
 
-Validate prints the gateway `tools/list` result and calls the names that list returns. The documented tool name is `${target}___${tool}` (three underscores). A policy denial is the Cedar text `Tool Execution Denied`, not a protocol or validation error. The code interpreter role trusts `arn:aws:bedrock-agentcore:REGION:ACCOUNT:*`, which is the execution-role form in the Code Interpreter docs. Rerun enable after that trust change so the existing role is updated, then validate.
+Validate waits until the ReviewTools target is `READY`, then prints `tools/list`. When ENFORCE hides every tool, it prints `allowed-scope` and calls the Cedar permit names. The documented tool name is `${target}___${tool}` (three underscores). A policy denial is the Cedar text `Tool Execution Denied`, not a protocol or validation error. Rerun enable so the gateway role trust is rewritten and the existing gateway is reused, then validate.
 
 Expected lines:
 

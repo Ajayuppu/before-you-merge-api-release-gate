@@ -12,14 +12,21 @@ from scripts.agentcore_setup import (
     NAME_PATTERNS,
     READ_TOOL,
     SERVICE_PRINCIPAL,
+    _stream_text,
+    checker_result_ok,
     classify_tool_result,
     code_interpreter_source_arn,
+    find_gateway_summary,
     gateway_permissions,
+    gateway_source_arn,
     negotiated_protocol,
+    parse_checker_output,
+    policy_engine_attached,
     protocol_from_gateway,
     select_gateway_tools,
     tool_configuration,
     tool_names_from_list,
+    tools_or_allowed_scope,
     trust_policy,
 )
 
@@ -38,6 +45,60 @@ def test_resource_names_match_documented_patterns():
     for label, (name, pattern) in NAME_PATTERNS.items():
         assert re.fullmatch(pattern, name), label
         assert "-" not in name or label in {"gateway", "gateway_target"}
+
+
+def test_gateway_trust_stays_account_wide():
+    source = gateway_source_arn("111122223333", "us-east-1")
+    assert source == "arn:aws:bedrock-agentcore:us-east-1:111122223333:*"
+    assert ":gateway/" not in source
+    document = trust_policy("111122223333", "us-east-1", source)
+    assert document["Statement"][0]["Condition"]["ArnLike"]["aws:SourceArn"] == source
+    assert document["Statement"][0]["Principal"] == {"Service": SERVICE_PRINCIPAL}
+
+
+def test_gateway_lookup_uses_items_and_the_lowercase_id():
+    page = {"items": [{"gatewayId": "apireviewtools-l0jmrlboyy", "name": "ApiReviewTools"}]}
+    assert find_gateway_summary([page], "ApiReviewTools")["gatewayId"] == "apireviewtools-l0jmrlboyy"
+    folded = {"items": [{"gatewayId": "apireviewtools-l0jmrlboyy", "name": "apireviewtools"}]}
+    assert find_gateway_summary([folded], "ApiReviewTools")["gatewayId"] == "apireviewtools-l0jmrlboyy"
+    assert find_gateway_summary([{"gateways": [], "gatewaySummaries": []}], "ApiReviewTools") is None
+    attached = {"policyEngineConfiguration": {"arn": "arn:engine", "mode": "ENFORCE"}}
+    assert policy_engine_attached(attached, "arn:engine") is True
+    assert policy_engine_attached({"policyEngineConfiguration": {"arn": "arn:other", "mode": "ENFORCE"}}, "arn:engine") is False
+
+
+def test_empty_tool_list_uses_the_cedar_scope():
+    names, fallback = tools_or_allowed_scope([])
+    assert fallback is True
+    read_name, approve_name = select_gateway_tools(names)
+    assert read_name == "ReviewTools___read_artifacts"
+    assert approve_name == "ReviewTools___approve"
+    listed, listed_fallback = tools_or_allowed_scope(["ReviewTools__read_artifacts"])
+    assert listed_fallback is False
+    assert select_gateway_tools(listed) == ("ReviewTools__read_artifacts", "ReviewTools__approve")
+
+
+def test_checker_output_parses_the_first_object_and_expected_findings():
+    raw = (
+        "stdout\n"
+        '{"authoritative":false,"checkerVersion":"1.0.0","findings":['
+        '{"message":"Order.amount must stay type number for old clients.","rule":"checker.amount.type"},'
+        '{"message":"OrderPage.next_cursor must remain a required response property.","rule":"checker.next_cursor.required"}'
+        '],"ok":false}\n'
+    )
+    parsed = parse_checker_output(raw)
+    assert parsed is not None
+    assert checker_result_ok(parsed) is True
+    joined = _stream_text(
+        {
+            "stream": [
+                {"result": {"content": [{"type": "text", "text": raw[:80]}]}},
+                {"result": {"stdout": raw[80:]}},
+            ]
+        }
+    )
+    assert checker_result_ok(parse_checker_output(joined)) is True
+    assert checker_result_ok(parse_checker_output(raw[:120])) is False
 
 
 def test_code_interpreter_trust_uses_the_documented_source_arn():

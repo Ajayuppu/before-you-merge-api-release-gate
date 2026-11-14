@@ -31,6 +31,12 @@ TAG_KEY = "api-review"
 TAG_VALUE = "agentcore"
 READ_TOOL = "ReviewTools___read_artifacts"
 APPROVE_TOOL = "ReviewTools___approve"
+ALLOWED_SCOPE = (
+    "ReviewTools___read_artifacts",
+    "ReviewTools___request_spec_check",
+    "ReviewTools___read_test_results",
+)
+EXPECTED_CHECKER_RULES = frozenset({"checker.amount.type", "checker.next_cursor.required"})
 # Live gateways created before the later protocol versions advertise only this one.
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-using.html
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -65,6 +71,18 @@ SERVICE_PRINCIPAL = "bedrock-agentcore.amazonaws.com"
 def code_interpreter_source_arn(account: str, region: str) -> str:
     """Documented execution-role SourceArn. A specific code-interpreter id does not match at session start.
 
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-session-management.html
+    """
+    return f"arn:aws:bedrock-agentcore:{region}:{account}:*"
+
+
+def gateway_source_arn(account: str, region: str) -> str:
+    """Account-wide SourceArn for the gateway role.
+
+    CreateGateway assumes the role while validating the policy engine, and that
+    source ARN is the policy engine, not the gateway. A gateway-only ArnLike
+    rejects that check. The same wildcard is the documented code-interpreter form.
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-prerequisites-permissions.html
     https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-session-management.html
     """
     return f"arn:aws:bedrock-agentcore:{region}:{account}:*"
@@ -204,6 +222,83 @@ def select_gateway_tools(names: list[str]) -> tuple[str, str]:
     return read, approve
 
 
+def tools_or_allowed_scope(names: list[str]) -> tuple[list[str], bool]:
+    """ENFORCE hides tools the caller cannot list. Fall back to the Cedar permits."""
+    if names:
+        return names, False
+    return list(ALLOWED_SCOPE), True
+
+
+def is_named_gateway(item: dict[str, Any], name: str) -> bool:
+    """ListGateways returns items. The id is the lowercased name plus a suffix."""
+    wanted = name.casefold()
+    current = str(item.get("name") or "").casefold()
+    identifier = str(item.get("gatewayId") or item.get("id") or "").casefold()
+    return current == wanted or identifier == wanted or identifier.startswith(wanted + "-")
+
+
+def find_gateway_summary(pages: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for page in pages:
+        for item in _items(page, "items", "gateways", "gatewaySummaries"):
+            if isinstance(item, dict) and is_named_gateway(item, name):
+                return item
+    return None
+
+
+def policy_engine_attached(gateway: dict[str, Any], engine_arn: str) -> bool:
+    policy = gateway.get("policyEngineConfiguration") or {}
+    return policy.get("arn") == engine_arn and str(policy.get("mode") or "").upper() == "ENFORCE"
+
+
+def parse_checker_output(text: str) -> dict[str, Any] | None:
+    """Read the first balanced object. The last '{' is inside findings, not the root."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    whole = _load_object(stripped)
+    if whole is not None:
+        return whole
+    start = stripped.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(stripped[start:], start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return _load_object(stripped[start : index + 1])
+    return None
+
+
+def checker_result_ok(parsed: dict[str, Any] | None) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    rules = {item.get("rule") for item in parsed.get("findings") or [] if isinstance(item, dict)}
+    return parsed.get("ok") is False and EXPECTED_CHECKER_RULES <= rules
+
+
+def _load_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _is_policy_denial(body: str) -> bool:
     if _is_protocol_error(body):
         return False
@@ -330,13 +425,13 @@ def enable(region: str) -> None:
     account = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
     api_id = _review_api_id(boto3.client("cloudformation", region_name=region), os.environ.get("STACK_NAME", "api-review"))
     iam = boto3.client("iam")
-    broad = f"arn:aws:bedrock-agentcore:{region}:{account}:*"
     interpreter_trust = code_interpreter_source_arn(account, region)
+    gateway_trust = gateway_source_arn(account, region)
     execution = os.environ.get("EXECUTION_ROLE_ARN") or _ensure_role(
         iam, INTERPRETER_ROLE, trust_policy(account, region, interpreter_trust), None, "code interpreter role"
     )
     gateway_role = os.environ.get("GATEWAY_ROLE_ARN") or _ensure_role(
-        iam, GATEWAY_ROLE, trust_policy(account, region, broad), gateway_permissions(account, region, api_id), "gateway role"
+        iam, GATEWAY_ROLE, trust_policy(account, region, gateway_trust), gateway_permissions(account, region, api_id), "gateway role"
     )
     control = boto3.client("bedrock-agentcore-control", region_name=region)
     interpreter_id = _ensure_interpreter(control, execution)
@@ -344,8 +439,6 @@ def enable(region: str) -> None:
     _wait_ready(lambda: control.get_policy_engine(policyEngineId=engine["id"]), "policy engine")
     gateway = _ensure_gateway(control, gateway_role, engine["arn"])
     _wait_ready(lambda: control.get_gateway(gatewayIdentifier=gateway["id"]), "gateway")
-    if not os.environ.get("GATEWAY_ROLE_ARN"):
-        _ensure_role(iam, GATEWAY_ROLE, trust_policy(account, region, gateway["arn"]), gateway_permissions(account, region, api_id), "gateway role trust")
     _ensure_target(control, gateway["id"], api_id)
     _ensure_policies(control, engine["id"], gateway["arn"])
     state = {
@@ -406,6 +499,7 @@ def validate(region: str) -> int:
 
 
 def _validate_gateway(region: str, state: dict[str, str]) -> int:
+    _wait_review_target(region, state)
     job_id = _job_id()
     version = _gateway_protocol(region, state)
     session = _McpSession(region, state.get("gatewayUrl", ""), version)
@@ -418,7 +512,10 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
         return 2
     list_status, list_body = session.request("tools/list", {})
     print(f"tools/list {list_body}")
-    read_name, approve_name = select_gateway_tools(tool_names_from_list(list_body))
+    names, used_scope = tools_or_allowed_scope(tool_names_from_list(list_body))
+    if used_scope:
+        print("allowed-scope " + ", ".join(names))
+    read_name, approve_name = select_gateway_tools(names)
     if not read_name or not approve_name:
         detail = list_body[:300] if list_status else "tools/list returned no read_artifacts tool"
         print(f"FAIL gateway-read: {detail}")
@@ -478,14 +575,9 @@ def _validate_interpreter(region: str, state: dict[str, str]) -> int:
                 client.stop_code_interpreter_session(codeInterpreterIdentifier=interpreter_id, sessionId=session_id)
             except Exception:
                 pass
-    try:
-        parsed = json.loads(text[text.rfind("{") :])
-    except json.JSONDecodeError:
-        print(f"FAIL code-interpreter diff: unreadable output {text[:200]}")
-        return 1
-    rules = {item.get("rule") for item in parsed.get("findings") or []}
-    ok = parsed.get("ok") is False and {"checker.amount.type", "checker.next_cursor.required"} <= rules
-    print("PASS code-interpreter diff" if ok else f"FAIL code-interpreter diff: {text[:200]}")
+    parsed = parse_checker_output(text)
+    ok = checker_result_ok(parsed)
+    print("PASS code-interpreter diff" if ok else f"FAIL code-interpreter diff: {text[:300]}")
     return 0 if ok else 1
 
 
@@ -590,11 +682,25 @@ class _McpSession:
 def _stream_text(response: dict[str, Any]) -> str:
     chunks: list[str] = []
     for event in response.get("stream") or []:
-        result = event.get("result") or {}
-        for item in result.get("content") or []:
-            if isinstance(item, dict) and item.get("type") == "text":
-                chunks.append(str(item.get("text") or ""))
+        _collect_stream_text(event, chunks)
     return "".join(chunks)
+
+
+def _collect_stream_text(node: Any, chunks: list[str]) -> None:
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            chunks.append(str(node.get("text") or ""))
+            return
+        stdout = node.get("stdout")
+        if isinstance(stdout, str):
+            chunks.append(stdout)
+        for key, value in node.items():
+            if key in {"text", "stdout"}:
+                continue
+            _collect_stream_text(value, chunks)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_stream_text(item, chunks)
 
 
 def _job_id() -> str:
@@ -694,12 +800,11 @@ def _ensure_engine(control) -> dict[str, str]:
 
 
 def _ensure_gateway(control, role_arn: str, engine_arn: str) -> dict[str, str]:
-    found = _named_record(control.list_gateways, ("gateways", "gatewaySummaries"), GATEWAY_NAME, "gatewayId", "gatewayArn", "gatewayUrl")
+    found = find_gateway_summary(_list_pages(control.list_gateways), GATEWAY_NAME)
     if found:
-        print(f"Gateway {GATEWAY_NAME} already exists.")
-        return found
+        return _reuse_gateway(control, found, role_arn, engine_arn)
     try:
-        response = retry_iam(
+        response = _retry_assume_role(
             lambda: control.create_gateway(
                 name=GATEWAY_NAME,
                 description="MCP gateway for the three read-only review tools.",
@@ -714,41 +819,124 @@ def _ensure_gateway(control, role_arn: str, engine_arn: str) -> dict[str, str]:
     except Exception as exc:
         if not _is_conflict(exc):
             raise
-        found = _named_record(control.list_gateways, ("gateways", "gatewaySummaries"), GATEWAY_NAME, "gatewayId", "gatewayArn", "gatewayUrl")
+        found = find_gateway_summary(_list_pages(control.list_gateways), GATEWAY_NAME)
         if not found:
             raise
-        print(f"Gateway {GATEWAY_NAME} already exists.")
-        return found
-    return {"id": response["gatewayId"], "arn": response["gatewayArn"], "url": response.get("gatewayUrl", "")}
+        return _reuse_gateway(control, found, role_arn, engine_arn)
+    return _gateway_record(response)
+
+
+def _reuse_gateway(control, summary: dict[str, Any], role_arn: str, engine_arn: str) -> dict[str, str]:
+    identifier = summary.get("gatewayId") or summary.get("id")
+    current = control.get_gateway(gatewayIdentifier=identifier)
+    if policy_engine_attached(current, engine_arn):
+        print(f"Gateway {current.get('name') or GATEWAY_NAME} already exists.")
+        return _gateway_record(current)
+    print(f"Updating gateway {current.get('name') or GATEWAY_NAME} to attach the policy engine.")
+    payload: dict[str, Any] = {
+        "gatewayIdentifier": current.get("gatewayId") or identifier,
+        "name": current.get("name") or GATEWAY_NAME,
+        "authorizerType": current.get("authorizerType") or "AWS_IAM",
+        "protocolType": current.get("protocolType") or "MCP",
+        "roleArn": current.get("roleArn") or role_arn,
+        "description": current.get("description") or "MCP gateway for the three read-only review tools.",
+        "policyEngineConfiguration": {"arn": engine_arn, "mode": "ENFORCE"},
+    }
+    if isinstance(current.get("protocolConfiguration"), dict):
+        payload["protocolConfiguration"] = current["protocolConfiguration"]
+    updated = _retry_assume_role(lambda: control.update_gateway(**payload), "update gateway")
+    return _gateway_record(updated)
+
+
+def _gateway_record(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "id": payload.get("gatewayId") or "",
+        "arn": payload.get("gatewayArn") or payload.get("arn") or "",
+        "url": payload.get("gatewayUrl") or "",
+    }
+
+
+def _retry_assume_role(action, description: str):
+    from botocore.exceptions import ClientError
+
+    for attempt in range(1, 7):
+        try:
+            return action()
+        except ClientError as exc:
+            message = str(exc.response.get("Error", {}).get("Message") or "")
+            if "assumerole" not in message.lower() or attempt == 6:
+                raise
+            print(f"Retry {attempt + 1}/6 for {description}: role is not assumable yet")
+            time.sleep(10)
+    raise RuntimeError(description)
 
 
 def _ensure_target(control, gateway_id: str, api_id: str) -> None:
-    listed = control.list_gateway_targets(gatewayIdentifier=gateway_id)
-    existing = listed.get("items") or listed.get("targets") or []
-    for item in existing:
-        if item.get("name") == TARGET_NAME:
-            print(f"Gateway target {TARGET_NAME} already exists.")
-            return
-    try:
-        control.create_gateway_target(
-        gatewayIdentifier=gateway_id,
-        name=TARGET_NAME,
-        description="Review API routes. Approve is exposed so policy can deny it.",
-        targetConfiguration={
-            "mcp": {
-                "apiGateway": {
-                    "restApiId": api_id,
-                    "stage": "live",
-                    "apiGatewayToolConfiguration": tool_configuration(),
-                }
-            }
-        },
-        credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
-    )
-    except Exception as exc:
-        if not _is_conflict(exc):
-            raise
+    target_id = _target_id(control, gateway_id)
+    if target_id:
         print(f"Gateway target {TARGET_NAME} already exists.")
+    else:
+        try:
+            created = control.create_gateway_target(
+                gatewayIdentifier=gateway_id,
+                name=TARGET_NAME,
+                description="Review API routes. Approve is exposed so policy can deny it.",
+                targetConfiguration={
+                    "mcp": {
+                        "apiGateway": {
+                            "restApiId": api_id,
+                            "stage": "live",
+                            "apiGatewayToolConfiguration": tool_configuration(),
+                        }
+                    }
+                },
+                credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+            )
+            target_id = created.get("targetId") or _target_id(control, gateway_id)
+        except Exception as exc:
+            if not _is_conflict(exc):
+                raise
+            target_id = _target_id(control, gateway_id)
+            print(f"Gateway target {TARGET_NAME} already exists.")
+    if not target_id:
+        raise SystemExit(f"Gateway target {TARGET_NAME} was not created")
+    _wait_ready(
+        lambda: control.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id),
+        "gateway target",
+    )
+
+
+def _target_id(control, gateway_id: str) -> str:
+    listed = control.list_gateway_targets(gatewayIdentifier=gateway_id)
+    for item in listed.get("items") or listed.get("targets") or []:
+        if str(item.get("name") or "").casefold() == TARGET_NAME.casefold() and item.get("targetId"):
+            return item["targetId"]
+    return ""
+
+
+def _wait_review_target(region: str, state: dict[str, str]) -> None:
+    gateway_id = state.get("gatewayId") or ""
+    if not gateway_id:
+        return
+    import boto3
+
+    control = boto3.client("bedrock-agentcore-control", region_name=region)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        try:
+            target_id = _target_id(control, gateway_id)
+            payload = control.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id) if target_id else {}
+        except Exception:
+            time.sleep(5)
+            continue
+        status = str(payload.get("status") or "").upper()
+        if target_id and status in {"READY", "ACTIVE"}:
+            print(f"Gateway target {TARGET_NAME} is {status}.")
+            return
+        if "FAIL" in status or "UNSUCCESSFUL" in status:
+            raise SystemExit(f"gateway target entered {status}")
+        time.sleep(5)
+    raise SystemExit("gateway target was not ready")
 
 
 def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
@@ -787,7 +975,7 @@ def _wait_ready(reader, label: str) -> None:
         status = str(payload.get("status") or payload.get("Status") or "").upper()
         if status in {"READY", "ACTIVE", ""}:
             return
-        if "FAIL" in status:
+        if "FAIL" in status or "UNSUCCESSFUL" in status:
             raise SystemExit(f"{label} entered {status}")
         time.sleep(5)
     raise SystemExit(f"{label} was not ready")
@@ -822,15 +1010,27 @@ def _items(response: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
     return found
 
 
+def _list_pages(lister) -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+    token = None
+    while True:
+        page = lister(nextToken=token) if token else lister()
+        pages.append(page)
+        token = page.get("nextToken") or page.get("NextToken")
+        if not token:
+            return pages
+
+
 def _delete_named_gateway(control, gateway_id: str | None) -> None:
     identifiers = [gateway_id] if gateway_id else []
     try:
-        listed = control.list_gateways()
+        pages = _list_pages(control.list_gateways)
     except Exception:
-        listed = {}
-    for item in (listed.get("gateways") or listed.get("gatewaySummaries") or []):
-        if item.get("name") == GATEWAY_NAME:
-            identifiers.append(item.get("gatewayId"))
+        pages = []
+    for page in pages:
+        for item in _items(page, "items", "gateways", "gatewaySummaries"):
+            if is_named_gateway(item, GATEWAY_NAME):
+                identifiers.append(item.get("gatewayId"))
     for identifier in dict.fromkeys(item for item in identifiers if item):
         try:
             targets = control.list_gateway_targets(gatewayIdentifier=identifier)
