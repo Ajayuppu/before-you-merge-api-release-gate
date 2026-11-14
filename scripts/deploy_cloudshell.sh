@@ -29,7 +29,7 @@ aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK" \
   --template-file "$ROOT/cloud/template.deploy.json" \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM --s3-bucket "${BUCKET}" --s3-prefix api-review/templates \
   --parameter-overrides \
     "LambdaCodeBucket=${BUCKET}" \
     "LambdaCodeKey=api-review/lambda.zip" \
