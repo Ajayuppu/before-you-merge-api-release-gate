@@ -31,6 +31,9 @@ TAG_KEY = "api-review"
 TAG_VALUE = "agentcore"
 READ_TOOL = "ReviewTools___read_artifacts"
 APPROVE_TOOL = "ReviewTools___approve"
+# Live gateways created before the later protocol versions advertise only this one.
+# https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-using.html
+MCP_PROTOCOL_VERSION = "2025-03-26"
 
 # Documented name constraints:
 # CreateCodeInterpreter: [a-zA-Z][a-zA-Z0-9_]{0,47}
@@ -57,6 +60,14 @@ NAME_PATTERNS = {
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-prerequisites-permissions.html
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-permissions.html
 SERVICE_PRINCIPAL = "bedrock-agentcore.amazonaws.com"
+
+
+def code_interpreter_source_arn(account: str, region: str) -> str:
+    """Documented execution-role SourceArn. A specific code-interpreter id does not match at session start.
+
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-session-management.html
+    """
+    return f"arn:aws:bedrock-agentcore:{region}:{account}:*"
 
 
 def trust_policy(account: str, region: str, source_arn: str) -> dict[str, Any]:
@@ -136,27 +147,124 @@ def tool_configuration() -> dict[str, Any]:
 
 
 def classify_tool_result(expect_allow: bool, status: int, body: str) -> tuple[bool, str]:
-    denied = _looks_denied(body)
+    if _is_protocol_error(body):
+        return False, body[:300]
     if expect_allow:
-        ok = status < 400 and not denied
+        ok = _is_success_payload(status, body)
         return ok, "allowed" if ok else body[:300]
-    ok = denied or status in {401, 403}
+    ok = _is_policy_denial(body)
     return ok, "denied" if ok else body[:300]
 
 
-def _looks_denied(body: str) -> bool:
+def protocol_from_gateway(gateway: dict[str, Any] | None) -> str:
+    config = (gateway or {}).get("protocolConfiguration") or {}
+    mcp = config.get("mcp") or {}
+    versions = [str(item) for item in (mcp.get("supportedVersions") or [])]
+    if MCP_PROTOCOL_VERSION in versions:
+        return MCP_PROTOCOL_VERSION
+    if versions:
+        return versions[0]
+    return MCP_PROTOCOL_VERSION
+
+
+def negotiated_protocol(body: str, current: str) -> str | None:
+    parsed = _jsonrpc_payload(body)
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
+    message = str(error.get("message") or "")
+    data = error.get("data") if isinstance(error.get("data"), dict) else {}
+    supported = [str(item) for item in (data.get("supported") or [])]
+    if "protocol version" not in message.lower() or not supported:
+        return None
+    chosen = MCP_PROTOCOL_VERSION if MCP_PROTOCOL_VERSION in supported else supported[0]
+    if chosen == current:
+        return None
+    return chosen
+
+
+def tool_names_from_list(body: str) -> list[str]:
+    parsed = _jsonrpc_payload(body)
+    if not isinstance(parsed, dict):
+        return []
+    result = parsed.get("result") if isinstance(parsed.get("result"), dict) else {}
+    names: list[str] = []
+    for item in result.get("tools") or []:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
+
+
+def select_gateway_tools(names: list[str]) -> tuple[str, str]:
+    """Use the separator the gateway actually advertised. Denied tools may be hidden from tools/list."""
+    read = next((name for name in names if name.endswith("read_artifacts")), "")
+    approve = next((name for name in names if name.endswith("approve")), "")
+    if read and not approve:
+        approve = read[: -len("read_artifacts")] + "approve"
+    return read, approve
+
+
+def _is_policy_denial(body: str) -> bool:
+    if _is_protocol_error(body):
+        return False
     lowered = body.lower()
     markers = (
+        "tool execution denied",
+        "denied by policy",
+        "denied by default",
+        "no policy applies",
+        "authorizeactionexception",
+        "policy enforcement",
+        "explicit deny",
         "access denied",
         "accessdenied",
         "not authorized",
-        "not permitted",
-        "explicit deny",
         "authorization denied",
-        "is not authorized to perform",
-        "denied by policy",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _is_protocol_error(body: str) -> bool:
+    parsed = _jsonrpc_payload(body)
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if not isinstance(error, dict):
+        return "unsupported protocol version" in body.lower()
+    return "protocol version" in str(error.get("message") or "").lower()
+
+
+def _is_success_payload(status: int, body: str) -> bool:
+    if status <= 0 or status >= 400 or _is_policy_denial(body):
+        return False
+    parsed = _jsonrpc_payload(body)
+    if not isinstance(parsed, dict) or "error" in parsed:
+        return False
+    result = parsed.get("result")
+    if not isinstance(result, dict) or result.get("isError") is True:
+        return False
+    content = result.get("content") or result.get("structuredContent")
+    if not content:
+        return False
+    text = json.dumps(content)
+    return bool(text.strip()) and text not in {"[]", "{}", "null", '""'}
+
+
+def _jsonrpc_payload(body: str) -> dict[str, Any] | None:
+    text = body.strip()
+    if not text:
+        return None
+    candidates = [text]
+    data_lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    if data_lines:
+        candidates.append("\n".join(data_lines))
+        candidates.extend(data_lines)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def retry_iam(action, description: str):
@@ -223,8 +331,9 @@ def enable(region: str) -> None:
     api_id = _review_api_id(boto3.client("cloudformation", region_name=region), os.environ.get("STACK_NAME", "api-review"))
     iam = boto3.client("iam")
     broad = f"arn:aws:bedrock-agentcore:{region}:{account}:*"
+    interpreter_trust = code_interpreter_source_arn(account, region)
     execution = os.environ.get("EXECUTION_ROLE_ARN") or _ensure_role(
-        iam, INTERPRETER_ROLE, trust_policy(account, region, broad), None, "code interpreter role"
+        iam, INTERPRETER_ROLE, trust_policy(account, region, interpreter_trust), None, "code interpreter role"
     )
     gateway_role = os.environ.get("GATEWAY_ROLE_ARN") or _ensure_role(
         iam, GATEWAY_ROLE, trust_policy(account, region, broad), gateway_permissions(account, region, api_id), "gateway role"
@@ -237,14 +346,6 @@ def enable(region: str) -> None:
     _wait_ready(lambda: control.get_gateway(gatewayIdentifier=gateway["id"]), "gateway")
     if not os.environ.get("GATEWAY_ROLE_ARN"):
         _ensure_role(iam, GATEWAY_ROLE, trust_policy(account, region, gateway["arn"]), gateway_permissions(account, region, api_id), "gateway role trust")
-    if not os.environ.get("EXECUTION_ROLE_ARN"):
-        _ensure_role(
-            iam,
-            INTERPRETER_ROLE,
-            trust_policy(account, region, f"arn:aws:bedrock-agentcore:{region}:{account}:code-interpreter/{interpreter_id}"),
-            None,
-            "code interpreter role trust",
-        )
     _ensure_target(control, gateway["id"], api_id)
     _ensure_policies(control, engine["id"], gateway["arn"])
     state = {
@@ -306,18 +407,46 @@ def validate(region: str) -> int:
 
 def _validate_gateway(region: str, state: dict[str, str]) -> int:
     job_id = _job_id()
-    allow_status, allow_body = _call_tool(region, state.get("gatewayUrl", ""), READ_TOOL, {"jobId": job_id})
+    version = _gateway_protocol(region, state)
+    session = _McpSession(region, state.get("gatewayUrl", ""), version)
+    try:
+        session.open()
+    except Exception as exc:
+        detail = str(exc)[:300]
+        print(f"FAIL gateway-read: {detail}")
+        print(f"FAIL policy-deny: {detail}")
+        return 2
+    list_status, list_body = session.request("tools/list", {})
+    print(f"tools/list {list_body}")
+    read_name, approve_name = select_gateway_tools(tool_names_from_list(list_body))
+    if not read_name or not approve_name:
+        detail = list_body[:300] if list_status else "tools/list returned no read_artifacts tool"
+        print(f"FAIL gateway-read: {detail}")
+        print(f"FAIL policy-deny: {detail}")
+        return 2
+    allow_status, allow_body = session.request("tools/call", {"name": read_name, "arguments": {"jobId": job_id}})
     allow_ok, allow_detail = classify_tool_result(True, allow_status, allow_body)
-    print(f"{'PASS' if allow_ok else 'FAIL'} gateway-read {READ_TOOL}" + ("" if allow_ok else f": {allow_detail}"))
-    deny_status, deny_body = _call_tool(
-        region,
-        state.get("gatewayUrl", ""),
-        APPROVE_TOOL,
-        {"jobId": job_id, "decision": "approve"},
+    print(f"{'PASS' if allow_ok else 'FAIL'} gateway-read {read_name}" + ("" if allow_ok else f": {allow_detail}"))
+    deny_status, deny_body = session.request(
+        "tools/call",
+        {"name": approve_name, "arguments": {"jobId": job_id, "decision": "approve"}},
     )
     deny_ok, deny_detail = classify_tool_result(False, deny_status, deny_body)
-    print(f"{'PASS' if deny_ok else 'FAIL'} policy-deny {APPROVE_TOOL}" + ("" if deny_ok else f": {deny_detail}"))
+    print(f"{'PASS' if deny_ok else 'FAIL'} policy-deny {approve_name}" + ("" if deny_ok else f": {deny_detail}"))
     return int(not allow_ok) + int(not deny_ok)
+
+
+def _gateway_protocol(region: str, state: dict[str, str]) -> str:
+    gateway_id = state.get("gatewayId") or ""
+    if not gateway_id:
+        return MCP_PROTOCOL_VERSION
+    try:
+        import boto3
+
+        gateway = boto3.client("bedrock-agentcore-control", region_name=region).get_gateway(gatewayIdentifier=gateway_id)
+    except Exception:
+        return MCP_PROTOCOL_VERSION
+    return protocol_from_gateway(gateway)
 
 
 def _validate_interpreter(region: str, state: dict[str, str]) -> int:
@@ -331,11 +460,7 @@ def _validate_interpreter(region: str, state: dict[str, str]) -> int:
     interpreter_id = state["interpreterId"]
     session_id = ""
     try:
-        started = client.start_code_interpreter_session(
-            codeInterpreterIdentifier=interpreter_id,
-            name=SESSION_NAME,
-            sessionTimeoutSeconds=120,
-        )
+        started = _start_interpreter_session(client, interpreter_id)
         session_id = started["sessionId"]
         response = client.invoke_code_interpreter(
             codeInterpreterIdentifier=interpreter_id,
@@ -364,38 +489,102 @@ def _validate_interpreter(region: str, state: dict[str, str]) -> int:
     return 0 if ok else 1
 
 
-def _call_tool(region: str, gateway_url: str, name: str, arguments: dict[str, Any]) -> tuple[int, str]:
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-    from botocore.session import Session
-    import urllib.request
+def _start_interpreter_session(client, interpreter_id: str) -> dict[str, Any]:
+    from botocore.exceptions import ClientError
 
-    url = gateway_url.rstrip("/")
-    if not url.endswith("/mcp"):
-        url += "/mcp"
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {"name": name, "arguments": arguments}}
-    ).encode("utf-8")
-    request = AWSRequest(
-        method="POST",
-        url=url,
-        data=payload,
-        headers={"content-type": "application/json", "accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25"},
-    )
-    credentials = Session().get_credentials()
-    if credentials is None:
-        return 0, "no AWS credentials"
-    SigV4Auth(credentials.get_frozen_credentials(), "bedrock-agentcore", region).add_auth(request)
-    outbound = urllib.request.Request(url, data=payload, method="POST", headers=dict(request.headers.items()))
-    try:
-        with urllib.request.urlopen(outbound, timeout=60) as response:
-            return response.status, response.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        status = getattr(exc, "code", 0) or 0
-        body = ""
-        if hasattr(exc, "read"):
-            body = exc.read().decode("utf-8", errors="replace")
-        return int(status or 0), body or str(exc)
+    for attempt in range(1, 6):
+        try:
+            return client.start_code_interpreter_session(
+                codeInterpreterIdentifier=interpreter_id,
+                name=SESSION_NAME,
+                sessionTimeoutSeconds=120,
+            )
+        except ClientError as exc:
+            message = str(exc.response.get("Error", {}).get("Message") or "")
+            if "cannot be assumed" not in message.lower() or attempt == 5:
+                raise
+            print(f"Retry {attempt + 1}/5 for code interpreter session: execution role is not assumable yet")
+            time.sleep(5)
+    raise RuntimeError("start code interpreter session")
+
+
+class _McpSession:
+    def __init__(self, region: str, gateway_url: str, protocol: str) -> None:
+        self.region = region
+        self.gateway_url = gateway_url
+        self.protocol = protocol
+        self.session_id = ""
+
+    def open(self) -> None:
+        status, body, headers = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": self.protocol,
+                    "capabilities": {},
+                    "clientInfo": {"name": "api-review-validate", "version": "1"},
+                },
+            }
+        )
+        switched = negotiated_protocol(body, self.protocol)
+        if switched:
+            self.protocol = switched
+            status, body, headers = self._post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": self.protocol,
+                        "capabilities": {},
+                        "clientInfo": {"name": "api-review-validate", "version": "1"},
+                    },
+                }
+            )
+        if status >= 400 or _jsonrpc_payload(body) is None or "error" in (_jsonrpc_payload(body) or {}):
+            raise RuntimeError(body[:300] or f"initialize failed with status {status}")
+        self.session_id = headers.get("mcp-session-id") or headers.get("Mcp-Session-Id") or ""
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def request(self, method: str, params: dict[str, Any]) -> tuple[int, str]:
+        status, body, _headers = self._post({"jsonrpc": "2.0", "id": "1", "method": method, "params": params})
+        return status, body
+
+    def _post(self, payload: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.session import Session
+        import urllib.request
+
+        url = self.gateway_url.rstrip("/")
+        if not url.endswith("/mcp"):
+            url += "/mcp"
+        encoded = json.dumps(payload).encode("utf-8")
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": self.protocol,
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        request = AWSRequest(method="POST", url=url, data=encoded, headers=headers)
+        credentials = Session().get_credentials()
+        if credentials is None:
+            return 0, "no AWS credentials", {}
+        SigV4Auth(credentials.get_frozen_credentials(), "bedrock-agentcore", self.region).add_auth(request)
+        outbound = urllib.request.Request(url, data=encoded, method="POST", headers=dict(request.headers.items()))
+        try:
+            with urllib.request.urlopen(outbound, timeout=60) as response:
+                response_headers = {key.lower(): value for key, value in response.headers.items()}
+                return response.status, response.read().decode("utf-8", errors="replace"), response_headers
+        except Exception as exc:
+            status = getattr(exc, "code", 0) or 0
+            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            raw_headers = getattr(exc, "headers", None)
+            response_headers = {key.lower(): value for key, value in raw_headers.items()} if raw_headers else {}
+            return int(status or 0), body, response_headers
 
 
 def _stream_text(response: dict[str, Any]) -> str:

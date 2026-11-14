@@ -343,9 +343,12 @@ The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those 
 CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh
 ```
 
+Validate prints the gateway `tools/list` result and calls the names that list returns. The documented tool name is `${target}___${tool}` (three underscores). A policy denial is the Cedar text `Tool Execution Denied`, not a protocol or validation error. The code interpreter role trusts `arn:aws:bedrock-agentcore:REGION:ACCOUNT:*`, which is the execution-role form in the Code Interpreter docs. Rerun enable after that trust change so the existing role is updated, then validate.
+
 Expected lines:
 
 ```text
+tools/list ...
 PASS gateway-read ReviewTools___read_artifacts
 PASS policy-deny ReviewTools___approve
 PASS code-interpreter diff
