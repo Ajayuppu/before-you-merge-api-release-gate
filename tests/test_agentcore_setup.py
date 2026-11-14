@@ -11,6 +11,7 @@ from scripts.agentcore_setup import (
     MCP_PROTOCOL_VERSION,
     NAME_PATTERNS,
     READ_TOOL,
+    ROOT,
     SERVICE_PRINCIPAL,
     _stream_text,
     checker_result_ok,
@@ -22,8 +23,11 @@ from scripts.agentcore_setup import (
     negotiated_protocol,
     parse_checker_output,
     policy_engine_attached,
+    policy_statement_text,
     protocol_from_gateway,
+    render_policy,
     select_gateway_tools,
+    statements_match,
     tool_configuration,
     tool_names_from_list,
     tools_or_allowed_scope,
@@ -99,6 +103,29 @@ def test_checker_output_parses_the_first_object_and_expected_findings():
     )
     assert checker_result_ok(parse_checker_output(joined)) is True
     assert checker_result_ok(parse_checker_output(raw[:120])) is False
+
+
+def test_iam_permits_use_the_documented_action_and_principal():
+    arn = "arn:aws:bedrock-agentcore:us-east-1:111122223333:gateway/apireviewtools-l0jmrlboyy"
+    rendered = render_policy((ROOT / "cloud/agentcore/allow-read-artifacts.cedar").read_text(encoding="utf-8"), arn)
+    assert "principal is AgentCore::IamEntity" in rendered
+    assert 'AgentCore::Action::"ReviewTools___read_artifacts"' in rendered
+    assert "ReviewTools" + "___" + "read_artifacts" in rendered
+    assert "approve" not in rendered
+    assert arn in rendered
+    old = rendered.replace("principal is AgentCore::IamEntity", "principal")
+    assert statements_match(old, rendered) is False
+    assert statements_match(rendered, rendered.replace("\n", " ")) is True
+    assert policy_statement_text({"definition": {"cedar": {"statement": rendered}}}) == rendered
+    others = [
+        ROOT / "cloud/agentcore/allow-request-spec-check.cedar",
+        ROOT / "cloud/agentcore/allow-read-test-results.cedar",
+    ]
+    for path in others:
+        text = render_policy(path.read_text(encoding="utf-8"), arn)
+        assert "principal is AgentCore::IamEntity" in text
+        assert "___" in text
+        assert "approve" not in text
 
 
 def test_code_interpreter_trust_uses_the_documented_source_arn():

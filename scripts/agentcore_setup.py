@@ -222,6 +222,25 @@ def select_gateway_tools(names: list[str]) -> tuple[str, str]:
     return read, approve
 
 
+def render_policy(template: str, gateway_arn: str) -> str:
+    return template.replace("__GATEWAY_ARN__", gateway_arn)
+
+
+def statements_match(left: str, right: str) -> bool:
+    return " ".join(left.split()) == " ".join(right.split())
+
+
+def policy_statement_text(policy: dict[str, Any]) -> str:
+    definition = policy.get("definition") or {}
+    cedar = definition.get("cedar") or {}
+    if isinstance(cedar, dict) and cedar.get("statement"):
+        return str(cedar["statement"])
+    nested = definition.get("policy") or {}
+    if isinstance(nested, dict) and nested.get("statement"):
+        return str(nested["statement"])
+    return ""
+
+
 def tools_or_allowed_scope(names: list[str]) -> tuple[list[str], bool]:
     """ENFORCE hides tools the caller cannot list. Fall back to the Cedar permits."""
     if names:
@@ -500,6 +519,7 @@ def validate(region: str) -> int:
 
 def _validate_gateway(region: str, state: dict[str, str]) -> int:
     _wait_review_target(region, state)
+    _print_policies(region, state)
     job_id = _job_id()
     version = _gateway_protocol(region, state)
     session = _McpSession(region, state.get("gatewayUrl", ""), version)
@@ -514,7 +534,7 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
     print(f"tools/list {list_body}")
     names, used_scope = tools_or_allowed_scope(tool_names_from_list(list_body))
     if used_scope:
-        print("allowed-scope " + ", ".join(names))
+        print("allowed-scope " + ", ".join(repr(name) for name in names))
     read_name, approve_name = select_gateway_tools(names)
     if not read_name or not approve_name:
         detail = list_body[:300] if list_status else "tools/list returned no read_artifacts tool"
@@ -945,23 +965,88 @@ def _ensure_policies(control, engine_id: str, gateway_arn: str) -> None:
         ("AllowRequestSpecCheck", ROOT / "cloud/agentcore/allow-request-spec-check.cedar"),
         ("AllowReadTestResults", ROOT / "cloud/agentcore/allow-read-test-results.cedar"),
     ]
-    existing = {item.get("name") for item in _items(control.list_policies(policyEngineId=engine_id), "policies", "policySummaries")}
+    current = {item.get("name"): item for item in _policy_records(control, engine_id)}
     for name, path in files:
-        if name in existing:
-            print(f"Policy {name} already exists.")
-            continue
-        statement = path.read_text(encoding="utf-8").replace("__GATEWAY_ARN__", gateway_arn)
-        try:
-            control.create_policy(
+        statement = render_policy(path.read_text(encoding="utf-8"), gateway_arn)
+        found = current.get(name)
+        if not found:
+            created = control.create_policy(
                 policyEngineId=engine_id,
                 name=name,
                 validationMode="FAIL_ON_ANY_FINDINGS",
                 enforcementMode="ACTIVE",
                 definition={"cedar": {"statement": statement}},
             )
+            print(f"Created policy {name}.")
+            _wait_policy(control, engine_id, created.get("policyId") or "", name)
+            continue
+        policy_id = found.get("policyId") or found.get("id") or ""
+        detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
+        status = str(detail.get("status") or "")
+        same = statements_match(policy_statement_text(detail), statement) and detail.get("enforcementMode") == "ACTIVE"
+        if same and not status.endswith("FAILED"):
+            print(f"Policy {name} already exists.")
+            _wait_policy(control, engine_id, policy_id, name)
+            continue
+        print(f"Updating policy {name}.")
+        control.update_policy(
+            policyEngineId=engine_id,
+            policyId=policy_id,
+            definition={"cedar": {"statement": statement}},
+            enforcementMode="ACTIVE",
+            validationMode="FAIL_ON_ANY_FINDINGS",
+        )
+        _wait_policy(control, engine_id, policy_id, name)
+
+
+def _policy_records(control, engine_id: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    token = None
+    while True:
+        kwargs: dict[str, Any] = {"policyEngineId": engine_id}
+        if token:
+            kwargs["nextToken"] = token
+        page = control.list_policies(**kwargs)
+        records.extend(_items(page, "items", "policies", "policySummaries"))
+        token = page.get("nextToken") or page.get("NextToken")
+        if not token:
+            return records
+
+
+def _wait_policy(control, engine_id: str, policy_id: str, name: str) -> None:
+    if not policy_id:
+        raise SystemExit(f"policy {name} has no id")
+    _wait_ready(lambda: control.get_policy(policyEngineId=engine_id, policyId=policy_id), f"policy {name}")
+
+
+def _print_policies(region: str, state: dict[str, str]) -> None:
+    engine_id = state.get("engineId") or ""
+    if not engine_id:
+        print("policy none: missing engine id")
+        return
+    import boto3
+
+    control = boto3.client("bedrock-agentcore-control", region_name=region)
+    try:
+        records = _policy_records(control, engine_id)
+    except Exception as exc:
+        print(f"policy list failed: {exc}")
+        return
+    if not records:
+        print("policy none")
+        return
+    for item in records:
+        policy_id = item.get("policyId") or item.get("id")
+        try:
+            detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id) if policy_id else item
         except Exception as exc:
-            if not _is_conflict(exc):
-                raise
+            print(f"policy {item.get('name')} get failed: {exc}")
+            continue
+        print(
+            f"policy {detail.get('name') or item.get('name')} "
+            f"status={detail.get('status')} enforcement={detail.get('enforcementMode')} "
+            f"statement={policy_statement_text(detail)!r}"
+        )
 
 
 def _wait_ready(reader, label: str) -> None:
