@@ -27,6 +27,7 @@ ENGINE_NAME = "ApiReviewPolicy"
 TARGET_NAME = "ReviewTools"
 POLICY_NAMES = ("AllowReadArtifacts", "AllowRequestSpecCheck", "AllowReadTestResults")
 SESSION_NAME = "ApiReviewValidate"
+KNOWN_COMPLETED_JOB = "job_834a7b9a23c87ce25a83"
 TAG_KEY = "api-review"
 TAG_VALUE = "agentcore"
 # MCP tool and Cedar action id: ${target_name}___${tool_name}
@@ -171,11 +172,41 @@ def tool_configuration() -> dict[str, Any]:
         ],
         "toolOverrides": [
             {"name": "read_artifacts", "path": "/jobs/{jobId}", "method": "GET", "description": "Read one job. Not a verdict."},
-            {"name": "request_spec_check", "path": "/jobs/{jobId}/report", "method": "GET", "description": "Read the sealed report. Not a verdict."},
-            {"name": "read_test_results", "path": "/jobs", "method": "POST", "description": "Submit a job. Not a verdict."},
+            {"name": "read_test_results", "path": "/jobs/{jobId}/report", "method": "GET", "description": "Read the sealed report and harness results. Not a verdict."},
+            {"name": "request_spec_check", "path": "/jobs", "method": "POST", "description": "Submit a job for the fixed checker. Not a verdict."},
             {"name": "approve", "path": "/reviews", "method": "POST", "description": "Review callback. Cedar default deny must block this tool."},
         ],
     }
+
+
+def target_configuration(api_id: str) -> dict[str, Any]:
+    return {
+        "mcp": {
+            "apiGateway": {
+                "restApiId": api_id,
+                "stage": "live",
+                "apiGatewayToolConfiguration": tool_configuration(),
+            }
+        }
+    }
+
+
+def target_config_matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    def view(payload: dict[str, Any]) -> dict[str, Any]:
+        body = payload.get("targetConfiguration") if "targetConfiguration" in payload else payload
+        api = ((body or {}).get("mcp") or {}).get("apiGateway") or {}
+        tools = api.get("apiGatewayToolConfiguration") or {}
+        overrides = [
+            {key: item.get(key) for key in ("name", "path", "method", "description")}
+            for item in tools.get("toolOverrides") or []
+        ]
+        filters = [
+            {"filterPath": item.get("filterPath"), "methods": list(item.get("methods") or [])}
+            for item in tools.get("toolFilters") or []
+        ]
+        return {"restApiId": api.get("restApiId"), "stage": api.get("stage"), "toolOverrides": overrides, "toolFilters": filters}
+
+    return json.dumps(view(current), sort_keys=True) == json.dumps(view(desired), sort_keys=True)
 
 
 def classify_tool_result(expect_allow: bool, status: int, body: str) -> tuple[bool, str]:
@@ -684,9 +715,13 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
         print(f"FAIL gateway-read: {detail}")
         print(f"FAIL policy-deny: {detail}")
         return 2
-    allow_status, allow_body = session.request("tools/call", {"name": read_name, "arguments": {"jobId": job_id}})
+    arguments = {"jobId": job_id}
+    allow_status, allow_body = session.request("tools/call", {"name": read_name, "arguments": arguments})
     allow_ok, allow_detail = classify_tool_result(True, allow_status, allow_body)
     print(f"{'PASS' if allow_ok else 'FAIL'} gateway-read {read_name}" + ("" if allow_ok else f": {allow_detail}"))
+    if not allow_ok:
+        print(f"gateway-read jobId {job_id} arguments {json.dumps(arguments, sort_keys=True)}")
+        _print_recent_logs(region)
     deny_status, deny_body = session.request(
         "tools/call",
         {"name": approve_name, "arguments": {"jobId": job_id, "decision": "approve"}},
@@ -892,16 +927,103 @@ def _collect_stream_text(node: Any, chunks: list[str]) -> None:
             _collect_stream_text(item, chunks)
 
 
+def _print_recent_logs(region: str) -> None:
+    import subprocess
+
+    start = str(int((time.time() - 300) * 1000))
+    groups = [
+        "/aws/lambda/api-review-status",
+        "/aws/lambda/api-review-review-context",
+    ]
+    print("The report route is served by /aws/lambda/api-review-status.")
+    groups.extend(_discover_log_groups(region))
+    seen: set[str] = set()
+    for name in groups:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        completed = subprocess.run(
+            [
+                "aws",
+                "logs",
+                "filter-log-events",
+                "--region",
+                region,
+                "--log-group-name",
+                name,
+                "--start-time",
+                start,
+                "--limit",
+                "20",
+                "--output",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            print(f"logs {name}: {completed.stderr.strip()[:400]}")
+            continue
+        try:
+            payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            print(f"logs {name}: {completed.stdout[:400]}")
+            continue
+        events = payload.get("events") or []
+        print(f"logs {name}: {len(events)} events")
+        for event in events[-5:]:
+            message = str(event.get("message") or "").replace("\n", " ")
+            print(f"logs {name} {event.get('timestamp')} {message[:400]}")
+
+
+def _discover_log_groups(region: str) -> list[str]:
+    import subprocess
+
+    found: list[str] = []
+    for prefix in ("/aws/apigateway", "API-Gateway-Execution", "/aws/bedrock-agentcore", "/aws/vendedlogs"):
+        completed = subprocess.run(
+            [
+                "aws",
+                "logs",
+                "describe-log-groups",
+                "--region",
+                region,
+                "--log-group-name-prefix",
+                prefix,
+                "--query",
+                "logGroups[].logGroupName",
+                "--output",
+                "text",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            print(f"log groups {prefix}: {completed.stderr.strip()[:300]}")
+            continue
+        for name in completed.stdout.split():
+            if name not in found:
+                found.append(name)
+    return found[:12]
+
+
 def _job_id() -> str:
     import os
 
-    chosen = os.environ.get("JOB_ID", "")
+    chosen = os.environ.get("JOB_ID", "").strip()
     if chosen:
+        print(f"job id from JOB_ID {chosen}")
         return chosen
     path = Path.home() / ".api-review-last-job"
     if path.is_file():
-        return path.read_text(encoding="utf-8").strip()
-    return "job_" + "ab" * 10
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            print(f"job id from {path} {value}")
+            return value
+    print(f"job id fallback {KNOWN_COMPLETED_JOB}")
+    return KNOWN_COMPLETED_JOB
 
 
 def _review_api_id(cloudformation, stack_name: str) -> str:
@@ -1061,24 +1183,30 @@ def _retry_assume_role(action, description: str):
 
 
 def _ensure_target(control, gateway_id: str, api_id: str) -> None:
+    desired = target_configuration(api_id)
+    description = "Review API routes. Approve is exposed so policy can deny it."
     target_id = _target_id(control, gateway_id)
     if target_id:
-        print(f"Gateway target {TARGET_NAME} already exists.")
+        current = control.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
+        if target_config_matches(current, desired):
+            print(f"Gateway target {TARGET_NAME} already exists.")
+        else:
+            print(f"Updating gateway target {TARGET_NAME}.")
+            control.update_gateway_target(
+                gatewayIdentifier=gateway_id,
+                targetId=target_id,
+                name=TARGET_NAME,
+                description=description,
+                targetConfiguration=desired,
+                credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+            )
     else:
         try:
             created = control.create_gateway_target(
                 gatewayIdentifier=gateway_id,
                 name=TARGET_NAME,
-                description="Review API routes. Approve is exposed so policy can deny it.",
-                targetConfiguration={
-                    "mcp": {
-                        "apiGateway": {
-                            "restApiId": api_id,
-                            "stage": "live",
-                            "apiGatewayToolConfiguration": tool_configuration(),
-                        }
-                    }
-                },
+                description=description,
+                targetConfiguration=desired,
                 credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
             )
             target_id = created.get("targetId") or _target_id(control, gateway_id)

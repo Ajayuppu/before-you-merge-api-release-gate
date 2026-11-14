@@ -34,6 +34,8 @@ from scripts.agentcore_setup import (
     protocol_from_gateway,
     select_gateway_tools,
     target_tool_names,
+    target_config_matches,
+    target_configuration,
     tool_configuration,
     tool_names_from_list,
     tools_or_allowed_scope,
@@ -195,6 +197,19 @@ def test_trust_uses_the_agentcore_service_principal():
     assert statement["Action"] == "sts:AssumeRole"
     assert statement["Condition"]["StringEquals"]["aws:SourceAccount"] == "111122223333"
     assert statement["Condition"]["ArnLike"]["aws:SourceArn"].startswith("arn:aws:bedrock-agentcore:us-east-1:")
+
+
+def test_tool_routes_match_the_operation_names():
+    overrides = {item["name"]: item for item in tool_configuration()["toolOverrides"]}
+    assert (overrides["read_artifacts"]["method"], overrides["read_artifacts"]["path"]) == ("GET", "/jobs/{jobId}")
+    assert (overrides["read_test_results"]["method"], overrides["read_test_results"]["path"]) == ("GET", "/jobs/{jobId}/report")
+    assert (overrides["request_spec_check"]["method"], overrides["request_spec_check"]["path"]) == ("POST", "/jobs")
+    assert (overrides["approve"]["method"], overrides["approve"]["path"]) == ("POST", "/reviews")
+    current = {"targetConfiguration": target_configuration("abc123")}
+    assert target_config_matches(current, target_configuration("abc123")) is True
+    shifted = target_configuration("abc123")
+    shifted["mcp"]["apiGateway"]["apiGatewayToolConfiguration"]["toolOverrides"][1]["path"] = "/jobs"
+    assert target_config_matches(current, shifted) is False
 
 
 def test_gateway_role_can_call_developer_routes_and_not_reviews():

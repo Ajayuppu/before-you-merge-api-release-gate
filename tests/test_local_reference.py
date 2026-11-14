@@ -21,7 +21,7 @@ from apireview.evidence import authoritative_verdict
 from apireview.fixtures import validate_fixture
 from apireview.harness import HARNESS_VERSION, InProcessMockTransport, build_plan, run_harness
 from apireview.http_api import ReviewHTTPServer
-from apireview.identity import local_principal, principal_from_api_gateway
+from apireview.identity import caller_may_read_job, local_principal, principal_from_api_gateway
 from apireview.ids import ManualClock
 from apireview.limits import DISPATCHER_VISIBILITY_TIMEOUT_SECONDS, MOCK_VERSIONS
 from apireview.openapi_subset import is_json_number, parse_spec
@@ -495,6 +495,12 @@ def test_gateway_identity_reads_request_context_only():
     assert "developer" in developer.roles
     with pytest.raises(AuthorizationFailed):
         principal_from_api_gateway(gateway, expected_role_name="ApiReviewReviewer", simulation_account_allowed=True)
+    owner = "arn:aws:sts::111122223333:assumed-role/ApiReviewDeveloper/dev-ada"
+    gateway_arn = "arn:aws:sts::111122223333:assumed-role/ApiReviewGateway/outbound"
+    assert caller_may_read_job(owner, owner) is True
+    assert caller_may_read_job(gateway_arn, owner) is True
+    assert caller_may_read_job(gateway_arn, "arn:aws:sts::111122223333:assumed-role/ApiReviewReviewer/rev-ben") is False
+    assert caller_may_read_job("arn:aws:sts::111122223333:assumed-role/ApiReviewDeveloper/other", owner) is False
 
 
 def test_visibility_timeout_matches_the_documented_formula():

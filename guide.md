@@ -343,7 +343,7 @@ The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those 
 CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh
 ```
 
-Validate waits until the ReviewTools target is `READY`, prints each policy status, `statusReasons`, and statement, then calls the gateway as the `api-review-developer` profile (`ApiReviewDeveloper`). The ambient CloudShell credentials are not the gateway caller. A second call as `api-review-reviewer` must be denied. The code interpreter call still uses the ambient credentials. ENFORCE lists only tools an `ACTIVE` permit allows. Rerun enable so the permits are replaced, then validate.
+`read_artifacts` is `GET /jobs/{jobId}`. `read_test_results` is `GET /jobs/{jobId}/report`. `request_spec_check` is `POST /jobs`. Enable updates the gateway target when that mapping differs. The gateway signs the API call as `ApiReviewGateway`. That role may read a job owned by `ApiReviewDeveloper`; the status function otherwise returns 403 for a different owner, and the gateway shows that as an internal error. This ownership change is in the Lambda, so redeploy the stack before validate. Validate uses `JOB_ID` when it is set, then `~/.api-review-last-job`, then `job_834a7b9a23c87ce25a83`. Gateway calls still use the `api-review-developer` profile. A failed read prints that job id and the last five minutes of `/aws/lambda/api-review-status` (the report route uses that function), `/aws/lambda/api-review-review-context`, API Gateway access logs, and AgentCore log groups when they exist.
 
 Expected lines:
 

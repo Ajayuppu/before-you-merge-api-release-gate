@@ -121,6 +121,20 @@ def _role_name(user_arn: str) -> str:
     return match.group("role")
 
 
+def caller_may_read_job(caller_arn: str, owner_arn: str) -> bool:
+    """The gateway signs outbound calls as ApiReviewGateway, not as the developer session.
+
+    It may read a job owned by ApiReviewDeveloper. Any other caller must be the owner.
+    """
+    if caller_arn == owner_arn:
+        return True
+    return _is_role(caller_arn, GATEWAY_ROLE_NAME) and _is_role(owner_arn, DEVELOPER_ROLE_NAME)
+
+
+def _is_role(arn: str, role_name: str) -> bool:
+    return f":assumed-role/{role_name}/" in arn or arn.endswith(f":role/{role_name}")
+
+
 def _role_allowed(role_name: str, expected_role_name: str) -> bool:
     if role_name == expected_role_name:
         return True

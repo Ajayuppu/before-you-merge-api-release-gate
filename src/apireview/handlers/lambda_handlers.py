@@ -25,7 +25,7 @@ from apireview.errors import AuthorizationFailed, Conflict, FailClosed, NotFound
 from apireview.evidence import advisory_content_hash, seal_evidence
 from apireview.fixtures import validate_fixture
 from apireview.harness import HARNESS_VERSION, InProcessMockTransport, build_plan, run_harness
-from apireview.identity import DEVELOPER_ROLE_NAME, REVIEWER_ROLE_NAME, principal_from_api_gateway
+from apireview.identity import DEVELOPER_ROLE_NAME, REVIEWER_ROLE_NAME, caller_may_read_job, principal_from_api_gateway
 from apireview.ids import execution_name_for, new_job_id, new_nonce
 from apireview.intake import intake_documents
 from apireview.limits import MAX_REVIEW_COMMENT_CHARS, REVIEW_TTL_SECONDS
@@ -165,7 +165,7 @@ def status_handler(event: dict[str, Any], context: Any = None, table: DocumentTa
     try:
         principal = principal_from_api_gateway(event, expected_role_name=DEVELOPER_ROLE_NAME, simulation_account_allowed=settings.simulation_identity)
         job = _require(table, _path_job_id(event))
-        if principal.subject != job["owner"]:
+        if not caller_may_read_job(principal.subject, str(job.get("owner") or "")):
             raise AuthorizationFailed("job is owned by a different principal")
         if str(event.get("path", "")).endswith("/report"):
             if not job.get("evidence"):
