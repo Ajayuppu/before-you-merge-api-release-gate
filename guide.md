@@ -334,14 +334,23 @@ python3 scripts/aws_demo.py --region "$REGION" --profile api-review-reviewer rev
 The core path does not need it. If you want the SANDBOX interpreter and the gateway policy:
 
 ```bash
-CONFIRM_AGENTCORE=yes \
-  REGION="$REGION" \
-  EXECUTION_ROLE_ARN='role-you-created' \
-  GATEWAY_ROLE_ARN='role-you-created' \
-  bash scripts/enable_agentcore.sh
+CONFIRM_AGENTCORE=yes REGION=us-east-1 bash scripts/enable_agentcore.sh
 ```
 
-The script creates a code interpreter with `networkMode` `SANDBOX`, a policy engine, a gateway with `mode` `ENFORCE`, and three Cedar permits. It does not create an approve tool. Without `CONFIRM_AGENTCORE=yes` it exits 2. That refusal was observed in this session.
+The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those role ARNs are not already set. Both trust `bedrock-agentcore.amazonaws.com`, limited by `aws:SourceAccount` and `aws:SourceArn`. It tags them `api-review=agentcore`. It then creates a SANDBOX code interpreter, a policy engine, an IAM-authorized MCP gateway in `ENFORCE`, a Review API target, and the three Cedar permits. There is no permit for `approve`. Without `CONFIRM_AGENTCORE=yes` it exits 2.
+
+```bash
+CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh
+```
+
+Expected lines:
+
+```text
+PASS gateway-read ReviewTools___read_artifacts
+PASS policy-deny ReviewTools___approve
+PASS code-interpreter diff
+PASS agentcore-validation
+```
 
 After it exists, set the spec-check function environment `SPEC_CHECK_MODE` to `agentcore` and `CODE_INTERPRETER_ID` to the new id, then submit again. Until you do that, the template value remains `in-process`.
 
@@ -472,7 +481,7 @@ Only when you intend to remove the stack:
 CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/cleanup_cloudshell.sh
 ```
 
-The script empties the artifact bucket and the code bucket, deletes the stack, and removes the code bucket. It then runs `scripts/teardown_demo_identities.sh`, which deletes the operator user, both caller roles, and the three CLI profiles. Set `CLEANUP_IDENTITIES=no` to leave those identities in place. Without `CONFIRM_CLEANUP=yes` it exits 2. That refusal was observed in this session. It does not delete the AgentCore gateway or code interpreter if you created them with the optional script. Delete those with the matching `bedrock-agentcore-control` delete operations if you created them.
+The script first runs `scripts/teardown_agentcore.sh`, which deletes the `api-review` code interpreter, gateway, policy engine, and the two tagged AgentCore roles. Set `CLEANUP_AGENTCORE=no` to leave those. It then empties the artifact bucket and the code bucket, deletes the stack, and removes the code bucket. It then runs `scripts/teardown_demo_identities.sh`, which deletes the operator user, both caller roles, and the three CLI profiles. Set `CLEANUP_IDENTITIES=no` to leave those identities in place. Without `CONFIRM_CLEANUP=yes` it exits 2. That refusal was observed in this session.
 
 ## Gaps
 

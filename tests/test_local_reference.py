@@ -486,6 +486,15 @@ def test_gateway_identity_reads_request_context_only():
         principal_from_api_gateway(event, expected_role_name="ApiReviewDeveloper", simulation_account_allowed=True)
     with pytest.raises(AuthorizationFailed):
         principal_from_api_gateway(event, expected_role_name="ApiReviewReviewer", simulation_account_allowed=False)
+    gateway = {
+        "requestContext": {
+            "identity": {"userArn": "arn:aws:sts::example:assumed-role/ApiReviewGateway/gateway"}
+        }
+    }
+    developer = principal_from_api_gateway(gateway, expected_role_name="ApiReviewDeveloper", simulation_account_allowed=True)
+    assert "developer" in developer.roles
+    with pytest.raises(AuthorizationFailed):
+        principal_from_api_gateway(gateway, expected_role_name="ApiReviewReviewer", simulation_account_allowed=True)
 
 
 def test_visibility_timeout_matches_the_documented_formula():

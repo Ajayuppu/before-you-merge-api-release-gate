@@ -7,6 +7,9 @@ if [[ "${CONFIRM_CLEANUP:-}" != "yes" ]]; then
   exit 2
 fi
 : "${REGION:?Set REGION}"
+if [[ "${CLEANUP_AGENTCORE:-}" != "no" ]]; then
+  bash "$(cd "$(dirname "$0")" && pwd)/teardown_agentcore.sh"
+fi
 STACK="${STACK_NAME:-api-review}"
 outputs() {
   aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" --query "Stacks[0].Outputs" --output json

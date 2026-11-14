@@ -25,6 +25,7 @@ _IAM_USER = re.compile(
 
 DEVELOPER_ROLE_NAME = "ApiReviewDeveloper"
 REVIEWER_ROLE_NAME = "ApiReviewReviewer"
+GATEWAY_ROLE_NAME = "ApiReviewGateway"
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ def principal_from_api_gateway(
     if "example" in user_arn and not simulation_account_allowed:
         raise AuthorizationFailed("example account ARNs are refused in production mode")
     role_name = _role_name(user_arn)
-    if role_name != expected_role_name:
+    if not _role_allowed(role_name, expected_role_name):
         raise AuthorizationFailed("caller IAM role is not allowed for this method")
     return Principal(
         subject=user_arn,
@@ -120,8 +121,14 @@ def _role_name(user_arn: str) -> str:
     return match.group("role")
 
 
+def _role_allowed(role_name: str, expected_role_name: str) -> bool:
+    if role_name == expected_role_name:
+        return True
+    return expected_role_name == DEVELOPER_ROLE_NAME and role_name == GATEWAY_ROLE_NAME
+
+
 def _role_to_local(role_name: str) -> str:
-    if role_name == DEVELOPER_ROLE_NAME:
+    if role_name in {DEVELOPER_ROLE_NAME, GATEWAY_ROLE_NAME}:
         return "developer"
     if role_name == REVIEWER_ROLE_NAME:
         return "reviewer"
