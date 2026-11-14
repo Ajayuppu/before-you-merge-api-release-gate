@@ -11,12 +11,13 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from apireview.advisory import build_converse_request, deterministic_advisory, merge_advisory, parse_converse_response
 from apireview.agent_boundary import TrustedContext, ToolGateway, run_bounded_agent
 from apireview.aws_calls import publish_events, run_code_interpreter, start_or_reconcile
-from apireview.aws_dynamo import DocumentTable, error_code, loads_document
+from apireview.aws_dynamo import DocumentTable, dynamodb_number, error_code, loads_document
 from apireview.canonical import canonical_bytes, canonical_dumps, parse_json_bytes, sha256_bytes
 from apireview.checker import run_checker
 from apireview.diff import diff_specs, finding_digest
@@ -593,9 +594,15 @@ def _reject_authority(document: dict[str, Any]) -> None:
         raise ValidationFailed(f"request body cannot name authority fields: {found}")
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return dynamodb_number(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _response(status: int, payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        "body": json.dumps(payload, sort_keys=True),
+        "body": json.dumps(payload, sort_keys=True, default=_json_default),
         "headers": {"content-type": "application/json"},
         "statusCode": status,
     }

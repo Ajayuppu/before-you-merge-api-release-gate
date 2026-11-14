@@ -2,12 +2,14 @@
 
 Items store a canonical JSON document plus a few mirrored attributes so
 condition expressions can fail closed without trusting a read-modify-write.
+Reads turn JSON numbers into int when they are integral and float otherwise.
 The in-process fake used by tests is not Amazon DynamoDB.
 """
 
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 from typing import Any
 
 from apireview.canonical import canonical_dumps, parse_json_bytes
@@ -36,11 +38,29 @@ def dumps_document(document: dict[str, Any]) -> str:
     return canonical_dumps(document)
 
 
+def dynamodb_number(value: Decimal) -> int | float:
+    """Map a DynamoDB number to int when it is integral, otherwise float."""
+    integral = value.to_integral_value()
+    if value == integral:
+        return int(integral)
+    return float(value)
+
+
+def native_numbers(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return dynamodb_number(value)
+    if isinstance(value, dict):
+        return {key: native_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [native_numbers(item) for item in value]
+    return value
+
+
 def loads_document(text: str) -> dict[str, Any]:
     value = parse_json_bytes(text.encode("utf-8"), max_bytes=MAX_ITEM_BYTES, label="dynamodb document")
     if not isinstance(value, dict):
         raise Conflict("dynamodb document is not an object")
-    return value
+    return native_numbers(value)
 
 
 def item_from_document(pk: str, document: dict[str, Any]) -> dict[str, dict[str, str]]:
