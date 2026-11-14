@@ -57,7 +57,8 @@ def sub_escape(definition: str) -> str:
             raise SystemExit(f"state machine is missing {token}")
         definition = definition.replace(token, marker)
         sentinels[marker] = token
-    definition = definition.replace("$", "$$")
+    # Fn::Sub only treats ${...} specially; escape any other ${ as ${! and leave plain $ alone.
+    definition = definition.replace("${", "${!")
     for marker, token in sentinels.items():
         definition = definition.replace(marker, token)
     return definition

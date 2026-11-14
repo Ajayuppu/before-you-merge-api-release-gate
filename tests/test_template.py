@@ -12,12 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def fake_sub(text: str, mapping: dict[str, str]) -> str:
-    text = text.replace("$$", "\0")
+    """Mimic CloudFormation Fn::Sub: replace ${Name}, turn ${!x} into ${x}, keep every other $ as-is."""
     for key, value in mapping.items():
         text = text.replace("${" + key + "}", value)
-    if "${" in text:
-        raise AssertionError(text[text.index("${") : text.index("${") + 80])
-    return text.replace("\0", "$")
+    leftover = re.search(r"\$\{(?!!)", text)
+    if leftover:
+        raise AssertionError(text[leftover.start() : leftover.start() + 80])
+    return text.replace("${!", "${")
 
 
 def test_template_contracts():
