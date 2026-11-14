@@ -21,8 +21,11 @@ from scripts.agentcore_setup import (
     gateway_source_arn,
     negotiated_protocol,
     parse_checker_output,
+    CALLER_ROLE,
+    POLICY_VALIDATION_MODE,
     action_id,
     format_policy,
+    iam_entity_id,
     permitted_action_ids,
     permit_statement,
     policy_engine_attached,
@@ -133,10 +136,12 @@ def test_iam_permits_use_the_target_tool_names_and_report_failures():
     assert actions[0] == ("AllowReadArtifacts", "ReviewTools" + "___" + "read_artifacts")
     assert all("approve" not in action for _name, action in actions)
     assert action_id("ReviewTools", "ReviewTools__read_artifacts") == "ReviewTools__read_artifacts"
-    statement = permit_statement(arn, actions[0][1])
+    statement = permit_statement(arn, actions[0][1], iam_entity_id("111122223333", CALLER_ROLE))
     assert "principal is AgentCore::IamEntity" in statement
+    assert 'principal.id like "arn:aws:sts::111122223333:assumed-role/ApiReviewDeveloper*"' in statement
     assert f'resource == AgentCore::Gateway::"{arn}"' in statement
     assert 'AgentCore::Action::"ReviewTools___read_artifacts"' in statement
+    assert POLICY_VALIDATION_MODE == "FAIL_ON_ANY_FINDINGS"
     failed = {
         "name": "AllowReadArtifacts",
         "status": "CREATE_FAILED",

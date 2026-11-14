@@ -45,6 +45,11 @@ POLICY_TOOLS = (
     ("AllowRequestSpecCheck", "request_spec_check"),
     ("AllowReadTestResults", "read_test_results"),
 )
+POLICY_VALIDATION_MODE = "FAIL_ON_ANY_FINDINGS"
+CALLER_ROLE = "ApiReviewDeveloper"
+DENY_ROLE = "ApiReviewReviewer"
+CALLER_PROFILE = "api-review-developer"
+DENY_PROFILE = "api-review-reviewer"
 EXPECTED_CHECKER_RULES = frozenset({"checker.amount.type", "checker.next_cursor.required"})
 # Live gateways created before the later protocol versions advertise only this one.
 # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-using.html
@@ -301,10 +306,18 @@ def permitted_action_ids(target_name: str, tool_names: list[str]) -> list[tuple[
     return paired
 
 
-def permit_statement(gateway_arn: str, action: str) -> str:
-    """AWS_IAM callers are AgentCore::IamEntity. A specific action requires the gateway ARN.
+def iam_entity_id(account: str, role_name: str) -> str:
+    """Cedar strips the role session name before evaluation.
 
-    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-scope.html
+    https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-conditions.html
+    """
+    return f"arn:aws:sts::{account}:assumed-role/{role_name}"
+
+
+def permit_statement(gateway_arn: str, action: str, principal_id: str) -> str:
+    """One IAM role, one action, one gateway. An unconstrained IamEntity is overly permissive.
+
+    The id has no session suffix. The trailing * still matches that id, and a session suffix if one is present.
     https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies.html
     """
     return (
@@ -312,7 +325,10 @@ def permit_statement(gateway_arn: str, action: str) -> str:
         "  principal is AgentCore::IamEntity,\n"
         f'  action == AgentCore::Action::"{action}",\n'
         f'  resource == AgentCore::Gateway::"{gateway_arn}"\n'
-        ");\n"
+        ")\n"
+        "when {\n"
+        f'  principal.id like "{principal_id}*"\n'
+        "};\n"
     )
 
 
@@ -569,7 +585,9 @@ def enable(region: str) -> None:
     target = control.get_gateway_target(gatewayIdentifier=gateway["id"], targetId=target_id)
     discovered = target_tool_names(target)
     print(f"target tools {discovered}")
-    _ensure_policies(control, engine["id"], gateway["arn"], str(target.get("name") or TARGET_NAME), discovered)
+    _grant_gateway_invoke(iam, CALLER_ROLE, gateway["arn"])
+    _grant_gateway_invoke(iam, DENY_ROLE, gateway["arn"])
+    _ensure_policies(control, engine["id"], gateway["arn"], str(target.get("name") or TARGET_NAME), discovered, account)
     state = {
         "account": account,
         "engineArn": engine["arn"],
@@ -617,6 +635,9 @@ def validate(region: str) -> int:
     state = json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.is_file() else {}
     if not state:
         raise SystemExit(f"missing {STATE_PATH}; run scripts/enable_agentcore.sh first")
+    ambient = boto3.client("sts", region_name=region).get_caller_identity()["Arn"]
+    print(f"ambient caller {ambient}")
+    print(f"gateway caller profile {CALLER_PROFILE} role {CALLER_ROLE}")
     failures = 0
     failures += _validate_gateway(region, state)
     failures += _validate_interpreter(region, state)
@@ -632,14 +653,24 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
     _print_policies(region, state)
     job_id = _job_id()
     version = _gateway_protocol(region, state)
-    session = _McpSession(region, state.get("gatewayUrl", ""), version)
+    try:
+        caller = _profile_session(CALLER_PROFILE)
+        caller_arn = caller.client("sts", region_name=region).get_caller_identity()["Arn"]
+    except Exception as exc:
+        print(f"FAIL gateway-read: cannot assume {CALLER_PROFILE}: {exc}")
+        print(f"FAIL policy-deny: cannot assume {CALLER_PROFILE}: {exc}")
+        print(f"FAIL other-identity: cannot assume {CALLER_PROFILE}: {exc}")
+        return 3
+    print(f"gateway caller {caller_arn}")
+    session = _McpSession(region, state.get("gatewayUrl", ""), version, caller)
     try:
         session.open()
     except Exception as exc:
         detail = str(exc)[:300]
         print(f"FAIL gateway-read: {detail}")
         print(f"FAIL policy-deny: {detail}")
-        return 2
+        print(f"FAIL other-identity: {detail}")
+        return 3
     list_status, list_body = session.request("tools/list", {})
     print(f"tools/list {list_body}")
     names, used_scope = tools_or_allowed_scope(tool_names_from_list(list_body))
@@ -662,7 +693,9 @@ def _validate_gateway(region: str, state: dict[str, str]) -> int:
     )
     deny_ok, deny_detail = classify_tool_result(False, deny_status, deny_body)
     print(f"{'PASS' if deny_ok else 'FAIL'} policy-deny {approve_name}" + ("" if deny_ok else f": {deny_detail}"))
-    return int(not allow_ok) + int(not deny_ok)
+    other_ok, other_detail = _other_identity_denied(region, state, version, read_name, job_id)
+    print(f"{'PASS' if other_ok else 'FAIL'} other-identity {read_name}" + ("" if other_ok else f": {other_detail}"))
+    return int(not allow_ok) + int(not deny_ok) + int(not other_ok)
 
 
 def _gateway_protocol(region: str, state: dict[str, str]) -> str:
@@ -732,11 +765,34 @@ def _start_interpreter_session(client, interpreter_id: str) -> dict[str, Any]:
     raise RuntimeError("start code interpreter session")
 
 
+def _profile_session(profile: str):
+    import boto3
+
+    return boto3.Session(profile_name=profile)
+
+
+def _other_identity_denied(region: str, state: dict[str, str], version: str, tool_name: str, job_id: str) -> tuple[bool, str]:
+    try:
+        other = _profile_session(DENY_PROFILE)
+        other_arn = other.client("sts", region_name=region).get_caller_identity()["Arn"]
+    except Exception as exc:
+        return False, f"cannot assume {DENY_PROFILE}: {exc}"
+    print(f"other caller {other_arn}")
+    session = _McpSession(region, state.get("gatewayUrl", ""), version, other)
+    try:
+        session.open()
+    except Exception as exc:
+        return False, str(exc)[:300]
+    status, body = session.request("tools/call", {"name": tool_name, "arguments": {"jobId": job_id}})
+    return classify_tool_result(False, status, body)
+
+
 class _McpSession:
-    def __init__(self, region: str, gateway_url: str, protocol: str) -> None:
+    def __init__(self, region: str, gateway_url: str, protocol: str, aws_session=None) -> None:
         self.region = region
         self.gateway_url = gateway_url
         self.protocol = protocol
+        self.aws_session = aws_session
         self.session_id = ""
 
     def open(self) -> None:
@@ -794,7 +850,8 @@ class _McpSession:
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         request = AWSRequest(method="POST", url=url, data=encoded, headers=headers)
-        credentials = Session().get_credentials()
+        source = self.aws_session or Session()
+        credentials = source.get_credentials()
         if credentials is None:
             return 0, "no AWS credentials", {}
         SigV4Auth(credentials.get_frozen_credentials(), "bedrock-agentcore", self.region).add_auth(request)
@@ -1071,88 +1128,108 @@ def _wait_review_target(region: str, state: dict[str, str]) -> None:
     raise SystemExit("gateway target was not ready")
 
 
-def _ensure_policies(control, engine_id: str, gateway_arn: str, target_name: str, tool_names: list[str]) -> None:
+def _ensure_policies(control, engine_id: str, gateway_arn: str, target_name: str, tool_names: list[str], account: str) -> None:
+    principal = iam_entity_id(account, CALLER_ROLE)
+    desired = [
+        (name, action, permit_statement(gateway_arn, action, principal))
+        for name, action in permitted_action_ids(target_name, tool_names)
+    ]
     current = {item.get("name"): item for item in _policy_records(control, engine_id)}
-    for name, action in permitted_action_ids(target_name, tool_names):
-        statement = permit_statement(gateway_arn, action)
+    for name, action, statement in desired:
         print(f"policy {name} desired-action={action!r}")
         found = current.get(name)
-        if found and _failed_policy(control, engine_id, found):
-            found = None
         if not found:
-            _create_policy(control, engine_id, name, statement)
             continue
         policy_id = found.get("policyId") or found.get("id") or ""
         detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
         status = str(detail.get("status") or "").upper()
-        same = statements_match(policy_statement_text(detail), statement) and detail.get("enforcementMode") == "ACTIVE"
-        if same and status == "ACTIVE":
+        same = status == "ACTIVE" and detail.get("enforcementMode") == "ACTIVE" and statements_match(policy_statement_text(detail), statement)
+        if same:
             print(f"Policy {name} already exists.")
             print(format_policy(detail, name))
             continue
         print(format_policy(detail, name))
-        if status.endswith("FAILED"):
-            _delete_policy(control, engine_id, policy_id, name)
-            _create_policy(control, engine_id, name, statement)
+        _delete_policy(control, engine_id, policy_id, name)
+    failures: list[str] = []
+    current = {item.get("name"): item for item in _policy_records(control, engine_id)}
+    for name, _action, statement in desired:
+        found = current.get(name)
+        if found:
+            policy_id = found.get("policyId") or found.get("id") or ""
+            detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
+            if str(detail.get("status") or "").upper() == "ACTIVE" and statements_match(policy_statement_text(detail), statement):
+                continue
+            print(format_policy(detail, name))
+            failures.append(format_policy(detail, name))
             continue
-        print(f"Updating policy {name}.")
-        control.update_policy(
-            policyEngineId=engine_id,
-            policyId=policy_id,
-            definition={"cedar": {"statement": statement}},
-            enforcementMode="ACTIVE",
-            validationMode="FAIL_ON_ANY_FINDINGS",
-        )
-        updated = _wait_policy(control, engine_id, policy_id, name)
-        if str(updated.get("status") or "").upper().endswith("FAILED"):
-            _delete_policy(control, engine_id, policy_id, name)
-            _create_policy(control, engine_id, name, statement)
+        detail = _create_policy(control, engine_id, name, statement)
+        if str(detail.get("status") or "").upper() != "ACTIVE":
+            failures.append(format_policy(detail, name))
+    if failures:
+        raise SystemExit("policies were not active\n" + "\n".join(failures))
 
 
-def _failed_policy(control, engine_id: str, found: dict[str, Any]) -> bool:
-    policy_id = found.get("policyId") or found.get("id") or ""
-    if not policy_id:
-        return False
-    detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
-    status = str(detail.get("status") or "").upper()
-    if not status.endswith("FAILED"):
-        return False
-    print(format_policy(detail, str(found.get("name") or "")))
-    _delete_policy(control, engine_id, policy_id, str(found.get("name") or policy_id))
-    return True
+def _grant_gateway_invoke(iam, role_name: str, gateway_arn: str) -> None:
+    try:
+        iam.get_role(RoleName=role_name)
+    except Exception:
+        print(f"Role {role_name} is not present, so validate cannot use it yet.")
+        return
+    document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InvokeReviewGateway",
+                "Effect": "Allow",
+                "Action": ["bedrock-agentcore:InvokeGateway"],
+                "Resource": [gateway_arn],
+            }
+        ],
+    }
+    iam.put_role_policy(RoleName=role_name, PolicyName="api-review-invoke-gateway", PolicyDocument=json.dumps(document))
+    print(f"Granted {role_name} bedrock-agentcore:InvokeGateway.")
 
 
-def _create_policy(control, engine_id: str, name: str, statement: str) -> None:
-    # Schema validation is asynchronous. GetPolicy statusReasons is the validation report.
+def _create_policy(control, engine_id: str, name: str, statement: str) -> dict[str, Any]:
+    # Schema and semantic checks run asynchronously. statusReasons is the report.
     # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-create-update-validation.html
     created = control.create_policy(
         policyEngineId=engine_id,
         name=name,
-        validationMode="FAIL_ON_ANY_FINDINGS",
+        validationMode=POLICY_VALIDATION_MODE,
         enforcementMode="ACTIVE",
         definition={"cedar": {"statement": statement}},
     )
     print(f"Created policy {name}.")
-    detail = _wait_policy(control, engine_id, created.get("policyId") or "", name)
-    if str(detail.get("status") or "").upper() != "ACTIVE":
-        raise SystemExit(format_policy(detail, name))
+    return _wait_policy(control, engine_id, created.get("policyId") or "", name)
 
 
 def _delete_policy(control, engine_id: str, policy_id: str, name: str) -> None:
-    control.delete_policy(policyEngineId=engine_id, policyId=policy_id)
+    try:
+        control.delete_policy(policyEngineId=engine_id, policyId=policy_id)
+    except Exception as exc:
+        if not _is_not_found(exc):
+            raise
     deadline = time.time() + 180
     while time.time() < deadline:
+        gone = False
         try:
             detail = control.get_policy(policyEngineId=engine_id, policyId=policy_id)
         except Exception as exc:
-            if _is_not_found(exc):
-                print(f"Deleted policy {name}.")
-                return
+            if not _is_not_found(exc):
+                time.sleep(5)
+                continue
+            gone = True
+            detail = {}
+        if not gone:
+            status = str(detail.get("status") or "").upper()
+            if status == "DELETE_FAILED":
+                raise SystemExit(format_policy(detail, name))
             time.sleep(5)
             continue
-        status = str(detail.get("status") or "").upper()
-        if status == "DELETE_FAILED":
-            raise SystemExit(format_policy(detail, name))
+        if not any(item.get("name") == name for item in _policy_records(control, engine_id)):
+            print(f"Deleted policy {name}.")
+            return
         time.sleep(5)
     raise SystemExit(f"policy {name} was not deleted")
 

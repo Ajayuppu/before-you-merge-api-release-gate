@@ -337,20 +337,23 @@ The core path does not need it. If you want the SANDBOX interpreter and the gate
 CONFIRM_AGENTCORE=yes REGION=us-east-1 bash scripts/enable_agentcore.sh
 ```
 
-The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those role ARNs are not already set. Both trust `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` and `aws:SourceArn` set to `arn:aws:bedrock-agentcore:REGION:ACCOUNT:*`. The gateway role stays on that account wildcard: CreateGateway assumes it to validate the policy engine, and a gateway-only ARN does not match that check. It tags them `api-review=agentcore`. It reuses an existing gateway (ListGateways returns `items`; the id is the lowercased name plus a suffix) and attaches the policy engine if needed. It then creates a SANDBOX code interpreter, a policy engine, an IAM-authorized MCP gateway in `ENFORCE`, a Review API target, and the three Cedar permits. Each permit says `principal is AgentCore::IamEntity`, `action == AgentCore::Action::"<target>___<tool>"`, and `resource == AgentCore::Gateway::"<gateway arn>"`. The tool name is read from GetGatewayTarget (tool overrides and any inline tool schema). The separator is three underscores, the MCP action id in the policy-scope examples. Enable deletes a policy in `CREATE_FAILED` or `UPDATE_FAILED`, waits until it is gone, and creates it again. GetPolicy `statusReasons` is the schema-validation report. There is no permit for `approve`. Without `CONFIRM_AGENTCORE=yes` it exits 2.
+The script creates `ApiReviewCodeInterpreter` and `ApiReviewGateway` when those role ARNs are not already set. Both trust `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` and `aws:SourceArn` set to `arn:aws:bedrock-agentcore:REGION:ACCOUNT:*`. The gateway role stays on that account wildcard: CreateGateway assumes it to validate the policy engine, and a gateway-only ARN does not match that check. It tags them `api-review=agentcore`. It reuses an existing gateway (ListGateways returns `items`; the id is the lowercased name plus a suffix) and attaches the policy engine if needed. It then creates a SANDBOX code interpreter, a policy engine, an IAM-authorized MCP gateway in `ENFORCE`, a Review API target, and the three Cedar permits. Each permit allows one action on this gateway only when `principal.id like "arn:aws:sts::ACCOUNT:assumed-role/ApiReviewDeveloper*"`. Cedar strips the session name, and `*` also matches a session suffix. An unconstrained `AgentCore::IamEntity` is rejected as overly permissive. The action id is the target name, the separator, and the tool name from GetGatewayTarget. Enable deletes every policy that is not already that statement in `ACTIVE`, waits until the name is gone, then creates all three again with `FAIL_ON_ANY_FINDINGS`. GetPolicy `statusReasons` is the validation report. There is no permit for `approve`. Without `CONFIRM_AGENTCORE=yes` it exits 2.
 
 ```bash
 CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh
 ```
 
-Validate waits until the ReviewTools target is `READY`, prints each policy status, `statusReasons`, and statement, then prints `tools/list`. ENFORCE lists only tools an `ACTIVE` permit allows, so a failed policy leaves `tools/list` empty and the read is denied by default. Approve stays hidden because nothing permits it. Rerun enable so the failed policies are replaced, then validate.
+Validate waits until the ReviewTools target is `READY`, prints each policy status, `statusReasons`, and statement, then calls the gateway as the `api-review-developer` profile (`ApiReviewDeveloper`). The ambient CloudShell credentials are not the gateway caller. A second call as `api-review-reviewer` must be denied. The code interpreter call still uses the ambient credentials. ENFORCE lists only tools an `ACTIVE` permit allows. Rerun enable so the permits are replaced, then validate.
 
 Expected lines:
 
 ```text
+gateway caller arn:aws:sts::ACCOUNT:assumed-role/ApiReviewDeveloper/dev-ada
 tools/list ...
 PASS gateway-read ReviewTools___read_artifacts
 PASS policy-deny ReviewTools___approve
+other caller arn:aws:sts::ACCOUNT:assumed-role/ApiReviewReviewer/rev-ben
+PASS other-identity ReviewTools___read_artifacts
 PASS code-interpreter diff
 PASS agentcore-validation
 ```
