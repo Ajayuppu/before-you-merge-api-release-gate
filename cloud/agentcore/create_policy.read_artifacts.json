@@ -1,0 +1,11 @@
+{
+  "name": "AllowReviewReadTools",
+  "description": "Permit only the three read tools. Default deny covers every other tool. Use the cedar union member, not the Dogwood policy member.",
+  "validationMode": "FAIL_ON_ANY_FINDINGS",
+  "enforcementMode": "ACTIVE",
+  "definition": {
+    "cedar": {
+      "statement": "permit (principal, action == AgentCore::Action::\"ReviewTools___read_artifacts\", resource == AgentCore::Gateway::\"__GATEWAY_ARN__\");"
+    }
+  }
+}

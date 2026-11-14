@@ -1,0 +1,15 @@
+{
+  "version": "orders-v1",
+  "response": {
+    "status": 200,
+    "body": {
+      "orders": [
+        {
+          "id": "ord-1",
+          "amount": 19.95
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

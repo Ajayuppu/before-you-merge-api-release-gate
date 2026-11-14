@@ -1,0 +1,30 @@
+{
+  "fixtureVersion": "1",
+  "name": "orders-old-client",
+  "cases": [
+    {
+      "id": "list-orders",
+      "method": "GET",
+      "path": "/orders",
+      "query": {},
+      "expect": {
+        "status": 200,
+        "body": {
+          "orders": [
+            {
+              "id": "ord-1",
+              "amount": 19.95
+            }
+          ],
+          "next_cursor": null
+        },
+        "requiredPaths": [
+          "orders",
+          "orders[0].id",
+          "orders[0].amount",
+          "next_cursor"
+        ]
+      }
+    }
+  ]
+}

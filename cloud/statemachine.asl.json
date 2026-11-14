@@ -1,0 +1,323 @@
+{
+  "Comment": "API review gate. MarkBlocked and SucceedApproved are different outcomes. Finalize rechecks the sealed evidence before APPROVED is written. The task token is not an approval.",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Diff"
+    },
+    "Diff": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DiffFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Analyze"
+    },
+    "Analyze": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AnalyzeFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "SpecCheck"
+    },
+    "SpecCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SpecCheckFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Harness"
+    },
+    "Harness": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${HarnessFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Seal"
+    },
+    "Seal": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SealFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "evidenceHash.$": "$.Payload.evidenceHash",
+        "fixtureHash.$": "$.Payload.fixtureHash",
+        "harnessVersion.$": "$.Payload.harnessVersion",
+        "jobId.$": "$.Payload.jobId",
+        "mockVersion.$": "$.Payload.mockVersion",
+        "newSpecHash.$": "$.Payload.newSpecHash",
+        "oldSpecHash.$": "$.Payload.oldSpecHash",
+        "verdict.$": "$.Payload.verdict"
+      },
+      "ResultPath": "$",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Gate"
+    },
+    "Gate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.verdict",
+          "StringEquals": "PASS",
+          "Next": "WaitForReview"
+        }
+      ],
+      "Default": "MarkBlocked"
+    },
+    "MarkBlocked": {
+      "Type": "Succeed"
+    },
+    "WaitForReview": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSeconds": 3600,
+      "Parameters": {
+        "FunctionName": "${RegisterWaitFunctionArn}",
+        "Payload": {
+          "evidenceHash.$": "$.evidenceHash",
+          "jobId.$": "$.jobId",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.review",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": "$.error",
+          "Next": "Expire"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "Finalize"
+    },
+    "Finalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FinalizeFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload.result"
+      },
+      "ResultPath": "$.final",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "FailClosed"
+        }
+      ],
+      "Next": "AfterFinalize"
+    },
+    "AfterFinalize": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.final.result",
+          "StringEquals": "APPROVED",
+          "Next": "SucceedApproved"
+        },
+        {
+          "Variable": "$.final.result",
+          "StringEquals": "REJECTED",
+          "Next": "SucceedRejected"
+        }
+      ],
+      "Default": "FailClosed"
+    },
+    "Expire": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ExpireFunctionArn}",
+        "Payload": {
+          "jobId.$": "$.jobId"
+        }
+      },
+      "ResultPath": "$.expire",
+      "Next": "FailClosed"
+    },
+    "SucceedApproved": {
+      "Type": "Succeed"
+    },
+    "SucceedRejected": {
+      "Type": "Succeed"
+    },
+    "FailClosed": {
+      "Type": "Fail",
+      "Error": "FailClosed",
+      "Cause": "The evidence gate failed closed"
+    }
+  }
+}

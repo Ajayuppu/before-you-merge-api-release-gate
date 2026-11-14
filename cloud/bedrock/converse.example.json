@@ -1,0 +1,22 @@
+{
+  "modelId": "us.amazon.nova-2-lite-v1:0",
+  "system": [
+    {
+      "text": "Explain breaking API changes. Return one JSON object with explanations and proposals only. Do not return a verdict."
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "{\"task\":\"explain-breaking-changes\",\"findings\":[]}"
+        }
+      ]
+    }
+  ],
+  "inferenceConfig": {
+    "maxTokens": 1024,
+    "temperature": 0.0
+  }
+}

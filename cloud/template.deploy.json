@@ -1,0 +1,2910 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Serverless API breaking-change review gate. Research deployment asset. Not executed in the reference test run.",
+  "Parameters": {
+    "BedrockModelId": {
+      "Default": "us.amazon.nova-2-lite-v1:0",
+      "Description": "Bedrock model id used only if BEDROCK_ADVISORY is later changed to enabled.",
+      "Type": "String"
+    },
+    "DeploymentNonce": {
+      "Default": "1",
+      "Description": "Change this value to replace API Gateway deployments after an API body edit.",
+      "Type": "String"
+    },
+    "LambdaCodeBucket": {
+      "Description": "Bucket that holds the packaged Lambda zip.",
+      "Type": "String"
+    },
+    "LambdaCodeKey": {
+      "Description": "Key of the packaged Lambda zip.",
+      "Type": "String"
+    },
+    "OtelLayerArn": {
+      "Description": "Regional AWS Lambda Layer for OpenTelemetry ARN from the current AWS documentation.",
+      "MinLength": 20,
+      "Type": "String"
+    },
+    "ProjectName": {
+      "Default": "api-review",
+      "Type": "String"
+    }
+  },
+  "Resources": {
+    "ArtifactBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        }
+      }
+    },
+    "JobTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "StreamSpecification": {
+          "StreamViewType": "NEW_IMAGE"
+        },
+        "TableName": {
+          "Fn::Sub": "${ProjectName}-jobs"
+        }
+      }
+    },
+    "WorkerDlq": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${ProjectName}-worker-dlq"
+        }
+      }
+    },
+    "EventBridgeDlq": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${ProjectName}-eventbridge-dlq"
+        }
+      }
+    },
+    "WorkQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${ProjectName}-work"
+        },
+        "RedrivePolicy": {
+          "deadLetterTargetArn": {
+            "Fn::GetAtt": [
+              "WorkerDlq",
+              "Arn"
+            ]
+          },
+          "maxReceiveCount": 5
+        },
+        "VisibilityTimeout": 182
+      }
+    },
+    "ReviewBus": {
+      "Type": "AWS::Events::EventBus",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${ProjectName}"
+        }
+      }
+    },
+    "SubmitRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "EventBusName": {
+          "Ref": "ReviewBus"
+        },
+        "EventPattern": {
+          "detail-type": [
+            "JobSubmitted"
+          ],
+          "source": [
+            "api.review"
+          ]
+        },
+        "Name": {
+          "Fn::Sub": "${ProjectName}-submitted"
+        },
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "WorkQueue",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "EventBridgeDlq",
+                  "Arn"
+                ]
+              }
+            },
+            "Id": "WorkQueue"
+          }
+        ]
+      }
+    },
+    "QueuePolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sqs:SendMessage",
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": {
+                    "Fn::GetAtt": [
+                      "SubmitRule",
+                      "Arn"
+                    ]
+                  }
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Resource": {
+                "Fn::GetAtt": [
+                  "WorkQueue",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Action": "sqs:SendMessage",
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": {
+                    "Fn::GetAtt": [
+                      "SubmitRule",
+                      "Arn"
+                    ]
+                  }
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Resource": {
+                "Fn::GetAtt": [
+                  "EventBridgeDlq",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        },
+        "Queues": [
+          {
+            "Ref": "WorkQueue"
+          },
+          {
+            "Ref": "EventBridgeDlq"
+          }
+        ]
+      }
+    },
+    "SubmitRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"
+                  }
+                },
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:TransactWriteItems"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "StatusRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ReviewRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "states:SendTaskSuccess"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "PublisherRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:DescribeStream",
+                    "dynamodb:GetRecords",
+                    "dynamodb:GetShardIterator",
+                    "dynamodb:ListStreams"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "StreamArn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "events:PutEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ReviewBus",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "DispatcherRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "sqs:ChangeMessageVisibility",
+                    "sqs:DeleteMessage",
+                    "sqs:GetQueueAttributes",
+                    "sqs:ReceiveMessage"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "WorkQueue",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "states:DescribeExecution",
+                    "states:StartExecution"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${ProjectName}:*"
+                    }
+                  ]
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkflowRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "AnalyzeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"
+                  }
+                },
+                {
+                  "Action": [
+                    "bedrock:InvokeModel"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-2-lite-v1:0"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                    }
+                  ]
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "HarnessRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/*"
+                  }
+                },
+                {
+                  "Action": [
+                    "execute-api:Invoke"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MockApi}/live/GET/orders-v1/orders"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MockApi}/live/GET/orders-v2-broken/orders"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MockApi}/live/GET/orders-v2-corrected/orders"
+                    }
+                  ]
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "RegisterRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobTable",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*"
+                  }
+                },
+                {
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "SubmitLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-submit"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "SubmitFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "SubmitLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-submit"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-submit"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.submit_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "SubmitRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "StatusLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-status"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "StatusFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "StatusLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-status"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-status"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.status_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "StatusRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 10,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "ReviewLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-review"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "ReviewFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ReviewLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-review"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-review"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.review_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "ReviewRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "ReviewContextLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-review-context"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "ReviewContextFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ReviewContextLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-review-context"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-review-context"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.review_context_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "ReviewRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 10,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "PublisherLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-publisher"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "PublisherFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "PublisherLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-publisher"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-publisher"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.publisher_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "PublisherRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 20,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "DispatcherLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-dispatcher"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "DispatcherFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "DispatcherLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-dispatcher"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-dispatcher"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.dispatcher_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "DispatcherRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 30,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "ValidateLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-validate"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "ValidateFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ValidateLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-validate"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-validate"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.validate_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "DiffLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-diff"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "DiffFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "DiffLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-diff"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-diff"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.diff_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "AnalyzeLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-analyze"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "AnalyzeFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "AnalyzeLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-analyze"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-analyze"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.analyze_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "AnalyzeRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 30,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "SpecCheckLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-spec-check"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "SpecCheckFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "SpecCheckLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-spec-check"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-spec-check"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.spec_check_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 60,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "HarnessLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-harness"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "HarnessFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "HarnessLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-harness"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-harness"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.harness_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "HarnessRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 20,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "SealLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-seal"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "SealFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "SealLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-seal"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-seal"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.seal_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "RegisterWaitLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-register-wait"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "RegisterWaitFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "RegisterWaitLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-register-wait"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-register-wait"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.register_wait_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "RegisterRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "FinalizeLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-finalize"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "FinalizeFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "FinalizeLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-finalize"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-finalize"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.finalize_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "ExpireLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${ProjectName}-expire"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "ExpireFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ExpireLogGroup",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaCodeBucket"
+          },
+          "S3Key": {
+            "Ref": "LambdaCodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARTIFACT_BUCKET_NAME": {
+              "Ref": "ArtifactBucket"
+            },
+            "BEDROCK_ADVISORY": "disabled",
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "EVENT_BUS_NAME": {
+              "Ref": "ReviewBus"
+            },
+            "HARNESS_TRANSPORT": "signed-mock",
+            "JOB_TABLE_NAME": {
+              "Ref": "JobTable"
+            },
+            "LOCAL_IDENTITY_SIMULATION": "false",
+            "MOCK_API_HOST": {
+              "Fn::Sub": "${MockApi}.execute-api.${AWS::Region}.amazonaws.com"
+            },
+            "MOCK_STAGE": "live",
+            "OTEL_AWS_APPLICATION_SIGNALS_ENABLED": "false",
+            "OTEL_PROPAGATORS": "xray,tracecontext",
+            "OTEL_SERVICE_NAME": {
+              "Fn::Sub": "${ProjectName}-expire"
+            },
+            "REVIEW_TTL_SECONDS": "3600",
+            "SPEC_CHECK_MODE": "in-process",
+            "STATE_MACHINE_ARN": {
+              "Fn::Sub": "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}"
+            },
+            "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+          }
+        },
+        "FunctionName": {
+          "Fn::Sub": "${ProjectName}-expire"
+        },
+        "Handler": "apireview.handlers.lambda_handlers.expire_handler",
+        "Layers": [
+          {
+            "Ref": "OtelLayerArn"
+          }
+        ],
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.12",
+        "Timeout": 15,
+        "TracingConfig": {
+          "Mode": "Active"
+        }
+      }
+    },
+    "PublisherMapping": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "BatchSize": 10,
+        "EventSourceArn": {
+          "Fn::GetAtt": [
+            "JobTable",
+            "StreamArn"
+          ]
+        },
+        "FunctionName": {
+          "Ref": "PublisherFunction"
+        },
+        "FunctionResponseTypes": [
+          "ReportBatchItemFailures"
+        ],
+        "StartingPosition": "LATEST"
+      }
+    },
+    "DispatcherMapping": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "BatchSize": 5,
+        "EventSourceArn": {
+          "Fn::GetAtt": [
+            "WorkQueue",
+            "Arn"
+          ]
+        },
+        "FunctionName": {
+          "Ref": "DispatcherFunction"
+        },
+        "FunctionResponseTypes": [
+          "ReportBatchItemFailures"
+        ],
+        "MaximumBatchingWindowInSeconds": 2
+      }
+    },
+    "ReviewApi": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Body": {
+          "info": {
+            "title": "api-review"
+          },
+          "paths": {
+            "/jobs": {
+              "post": {
+                "consumes": [
+                  "application/json"
+                ],
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "OK"
+                  },
+                  "201": {
+                    "description": "Created"
+                  },
+                  "202": {
+                    "description": "Accepted"
+                  },
+                  "400": {
+                    "description": "Rejected"
+                  },
+                  "403": {
+                    "description": "Denied"
+                  },
+                  "409": {
+                    "description": "Conflict"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations",
+                      {
+                        "Arn": {
+                          "Fn::GetAtt": [
+                            "SubmitFunction",
+                            "Arn"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "/jobs/{jobId}": {
+              "get": {
+                "consumes": [
+                  "application/json"
+                ],
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "OK"
+                  },
+                  "201": {
+                    "description": "Created"
+                  },
+                  "202": {
+                    "description": "Accepted"
+                  },
+                  "400": {
+                    "description": "Rejected"
+                  },
+                  "403": {
+                    "description": "Denied"
+                  },
+                  "409": {
+                    "description": "Conflict"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations",
+                      {
+                        "Arn": {
+                          "Fn::GetAtt": [
+                            "StatusFunction",
+                            "Arn"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "/jobs/{jobId}/report": {
+              "get": {
+                "consumes": [
+                  "application/json"
+                ],
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "OK"
+                  },
+                  "201": {
+                    "description": "Created"
+                  },
+                  "202": {
+                    "description": "Accepted"
+                  },
+                  "400": {
+                    "description": "Rejected"
+                  },
+                  "403": {
+                    "description": "Denied"
+                  },
+                  "409": {
+                    "description": "Conflict"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations",
+                      {
+                        "Arn": {
+                          "Fn::GetAtt": [
+                            "StatusFunction",
+                            "Arn"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "/jobs/{jobId}/review-context": {
+              "get": {
+                "consumes": [
+                  "application/json"
+                ],
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "OK"
+                  },
+                  "201": {
+                    "description": "Created"
+                  },
+                  "202": {
+                    "description": "Accepted"
+                  },
+                  "400": {
+                    "description": "Rejected"
+                  },
+                  "403": {
+                    "description": "Denied"
+                  },
+                  "409": {
+                    "description": "Conflict"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations",
+                      {
+                        "Arn": {
+                          "Fn::GetAtt": [
+                            "ReviewContextFunction",
+                            "Arn"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "/reviews": {
+              "post": {
+                "consumes": [
+                  "application/json"
+                ],
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "OK"
+                  },
+                  "201": {
+                    "description": "Created"
+                  },
+                  "202": {
+                    "description": "Accepted"
+                  },
+                  "400": {
+                    "description": "Rejected"
+                  },
+                  "403": {
+                    "description": "Denied"
+                  },
+                  "409": {
+                    "description": "Conflict"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations",
+                      {
+                        "Arn": {
+                          "Fn::GetAtt": [
+                            "ReviewFunction",
+                            "Arn"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "securityDefinitions": {
+            "sigv4": {
+              "in": "header",
+              "name": "Authorization",
+              "type": "apiKey",
+              "x-amazon-apigateway-authtype": "awsSigv4"
+            }
+          },
+          "swagger": "2.0"
+        },
+        "EndpointConfiguration": {
+          "Types": [
+            "REGIONAL"
+          ]
+        },
+        "Name": {
+          "Fn::Sub": "${ProjectName}"
+        }
+      }
+    },
+    "MockApi": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Body": {
+          "info": {
+            "title": "api-review-mocks"
+          },
+          "paths": {
+            "/orders-v1/orders": {
+              "get": {
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "Fixed order page"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "requestTemplates": {
+                    "application/json": "{\"statusCode\": 200}"
+                  },
+                  "responses": {
+                    "default": {
+                      "responseTemplates": {
+                        "application/json": "{\"next_cursor\":null,\"orders\":[{\"amount\":19.95,\"id\":\"ord-1\"}]}"
+                      },
+                      "statusCode": "200"
+                    }
+                  },
+                  "type": "mock"
+                }
+              }
+            },
+            "/orders-v2-broken/orders": {
+              "get": {
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "Fixed order page"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "requestTemplates": {
+                    "application/json": "{\"statusCode\": 200}"
+                  },
+                  "responses": {
+                    "default": {
+                      "responseTemplates": {
+                        "application/json": "{\"orders\":[{\"amount\":\"19.95\",\"id\":\"ord-1\"}]}"
+                      },
+                      "statusCode": "200"
+                    }
+                  },
+                  "type": "mock"
+                }
+              }
+            },
+            "/orders-v2-corrected/orders": {
+              "get": {
+                "produces": [
+                  "application/json"
+                ],
+                "responses": {
+                  "200": {
+                    "description": "Fixed order page"
+                  }
+                },
+                "security": [
+                  {
+                    "sigv4": []
+                  }
+                ],
+                "x-amazon-apigateway-auth": {
+                  "type": "AWS_IAM"
+                },
+                "x-amazon-apigateway-integration": {
+                  "requestTemplates": {
+                    "application/json": "{\"statusCode\": 200}"
+                  },
+                  "responses": {
+                    "default": {
+                      "responseTemplates": {
+                        "application/json": "{\"next_cursor\":null,\"orders\":[{\"amount\":19.95,\"currency\":\"USD\",\"id\":\"ord-1\"}]}"
+                      },
+                      "statusCode": "200"
+                    }
+                  },
+                  "type": "mock"
+                }
+              }
+            }
+          },
+          "securityDefinitions": {
+            "sigv4": {
+              "in": "header",
+              "name": "Authorization",
+              "type": "apiKey",
+              "x-amazon-apigateway-authtype": "awsSigv4"
+            }
+          },
+          "swagger": "2.0"
+        },
+        "EndpointConfiguration": {
+          "Types": [
+            "REGIONAL"
+          ]
+        },
+        "Name": {
+          "Fn::Sub": "${ProjectName}-mocks"
+        }
+      }
+    },
+    "ReviewDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "DependsOn": "ReviewApi",
+      "Properties": {
+        "Description": {
+          "Ref": "DeploymentNonce"
+        },
+        "RestApiId": {
+          "Ref": "ReviewApi"
+        }
+      }
+    },
+    "MockDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "DependsOn": "MockApi",
+      "Properties": {
+        "Description": {
+          "Ref": "DeploymentNonce"
+        },
+        "RestApiId": {
+          "Ref": "MockApi"
+        }
+      }
+    },
+    "ReviewStage": {
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "DeploymentId": {
+          "Ref": "ReviewDeployment"
+        },
+        "MethodSettings": [
+          {
+            "HttpMethod": "*",
+            "ResourcePath": "/*",
+            "ThrottlingBurstLimit": 20,
+            "ThrottlingRateLimit": 10
+          }
+        ],
+        "RestApiId": {
+          "Ref": "ReviewApi"
+        },
+        "StageName": "live",
+        "TracingEnabled": true
+      }
+    },
+    "MockStage": {
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "DeploymentId": {
+          "Ref": "MockDeployment"
+        },
+        "MethodSettings": [
+          {
+            "HttpMethod": "*",
+            "ResourcePath": "/*",
+            "ThrottlingBurstLimit": 20,
+            "ThrottlingRateLimit": 10
+          }
+        ],
+        "RestApiId": {
+          "Ref": "MockApi"
+        },
+        "StageName": "live",
+        "TracingEnabled": true
+      }
+    },
+    "SubmitPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "SubmitFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/POST/jobs"
+        }
+      }
+    },
+    "StatusPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "StatusFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/GET/jobs/*"
+        }
+      }
+    },
+    "ReviewPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "ReviewFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/POST/reviews"
+        }
+      }
+    },
+    "ReviewContextPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "ReviewContextFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/GET/jobs/*"
+        }
+      }
+    },
+    "StateMachineLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/states/${ProjectName}"
+        },
+        "RetentionInDays": 30
+      }
+    },
+    "StateMachineRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "states.amazonaws.com"
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "api-review-states",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "lambda:InvokeFunction"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": [
+                        "ValidateFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "DiffFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "AnalyzeFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "SpecCheckFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "HarnessFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "SealFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "RegisterWaitFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "FinalizeFunction",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "ExpireFunction",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeResourcePolicies",
+                    "logs:GetLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:PutResourcePolicy",
+                    "logs:UpdateLogDelivery"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
+                    "xray:PutTelemetryRecords",
+                    "xray:PutTraceSegments"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ReviewStateMachine": {
+      "Type": "AWS::StepFunctions::StateMachine",
+      "Properties": {
+        "DefinitionString": {
+          "Fn::Sub": [
+            "{\n  \"Comment\": \"API review gate. MarkBlocked and SucceedApproved are different outcomes. Finalize rechecks the sealed evidence before APPROVED is written. The task token is not an approval.\",\n  \"StartAt\": \"Validate\",\n  \"States\": {\n    \"Validate\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${ValidateFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"Lambda.ServiceException\",\n            \"Lambda.AWSLambdaException\",\n            \"Lambda.SdkClientException\",\n            \"Lambda.TooManyRequestsException\"\n          ],\n          \"IntervalSeconds\": 2,\n          \"MaxAttempts\": 3,\n          \"BackoffRate\": 2\n        }\n      ],\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Diff\"\n    },\n    \"Diff\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${DiffFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"Lambda.ServiceException\",\n            \"Lambda.AWSLambdaException\",\n            \"Lambda.SdkClientException\",\n            \"Lambda.TooManyRequestsException\"\n          ],\n          \"IntervalSeconds\": 2,\n          \"MaxAttempts\": 3,\n          \"BackoffRate\": 2\n        }\n      ],\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Analyze\"\n    },\n    \"Analyze\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${AnalyzeFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"Lambda.ServiceException\",\n            \"Lambda.AWSLambdaException\",\n            \"Lambda.SdkClientException\",\n            \"Lambda.TooManyRequestsException\"\n          ],\n          \"IntervalSeconds\": 2,\n          \"MaxAttempts\": 3,\n          \"BackoffRate\": 2\n        }\n      ],\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"SpecCheck\"\n    },\n    \"SpecCheck\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${SpecCheckFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"Lambda.ServiceException\",\n            \"Lambda.AWSLambdaException\",\n            \"Lambda.SdkClientException\",\n            \"Lambda.TooManyRequestsException\"\n          ],\n          \"IntervalSeconds\": 2,\n          \"MaxAttempts\": 3,\n          \"BackoffRate\": 2\n        }\n      ],\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Harness\"\n    },\n    \"Harness\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${HarnessFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Retry\": [\n        {\n          \"ErrorEquals\": [\n            \"Lambda.ServiceException\",\n            \"Lambda.AWSLambdaException\",\n            \"Lambda.SdkClientException\",\n            \"Lambda.TooManyRequestsException\"\n          ],\n          \"IntervalSeconds\": 2,\n          \"MaxAttempts\": 3,\n          \"BackoffRate\": 2\n        }\n      ],\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Seal\"\n    },\n    \"Seal\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${SealFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"evidenceHash.$$\": \"$$.Payload.evidenceHash\",\n        \"fixtureHash.$$\": \"$$.Payload.fixtureHash\",\n        \"harnessVersion.$$\": \"$$.Payload.harnessVersion\",\n        \"jobId.$$\": \"$$.Payload.jobId\",\n        \"mockVersion.$$\": \"$$.Payload.mockVersion\",\n        \"newSpecHash.$$\": \"$$.Payload.newSpecHash\",\n        \"oldSpecHash.$$\": \"$$.Payload.oldSpecHash\",\n        \"verdict.$$\": \"$$.Payload.verdict\"\n      },\n      \"ResultPath\": \"$$\",\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Gate\"\n    },\n    \"Gate\": {\n      \"Type\": \"Choice\",\n      \"Choices\": [\n        {\n          \"Variable\": \"$$.verdict\",\n          \"StringEquals\": \"PASS\",\n          \"Next\": \"WaitForReview\"\n        }\n      ],\n      \"Default\": \"MarkBlocked\"\n    },\n    \"MarkBlocked\": {\n      \"Type\": \"Succeed\"\n    },\n    \"WaitForReview\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke.waitForTaskToken\",\n      \"TimeoutSeconds\": 3600,\n      \"Parameters\": {\n        \"FunctionName\": \"${RegisterWaitFunctionArn}\",\n        \"Payload\": {\n          \"evidenceHash.$$\": \"$$.evidenceHash\",\n          \"jobId.$$\": \"$$.jobId\",\n          \"taskToken.$$\": \"$$$$.Task.Token\"\n        }\n      },\n      \"ResultPath\": \"$$.review\",\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.Timeout\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"Expire\"\n        },\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"Finalize\"\n    },\n    \"Finalize\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${FinalizeFunctionArn}\",\n        \"Payload.$$\": \"$$\"\n      },\n      \"ResultSelector\": {\n        \"result.$$\": \"$$.Payload.result\"\n      },\n      \"ResultPath\": \"$$.final\",\n      \"Catch\": [\n        {\n          \"ErrorEquals\": [\"States.ALL\"],\n          \"ResultPath\": \"$$.error\",\n          \"Next\": \"FailClosed\"\n        }\n      ],\n      \"Next\": \"AfterFinalize\"\n    },\n    \"AfterFinalize\": {\n      \"Type\": \"Choice\",\n      \"Choices\": [\n        {\n          \"Variable\": \"$$.final.result\",\n          \"StringEquals\": \"APPROVED\",\n          \"Next\": \"SucceedApproved\"\n        },\n        {\n          \"Variable\": \"$$.final.result\",\n          \"StringEquals\": \"REJECTED\",\n          \"Next\": \"SucceedRejected\"\n        }\n      ],\n      \"Default\": \"FailClosed\"\n    },\n    \"Expire\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"arn:aws:states:::lambda:invoke\",\n      \"Parameters\": {\n        \"FunctionName\": \"${ExpireFunctionArn}\",\n        \"Payload\": {\n          \"jobId.$$\": \"$$.jobId\"\n        }\n      },\n      \"ResultPath\": \"$$.expire\",\n      \"Next\": \"FailClosed\"\n    },\n    \"SucceedApproved\": {\n      \"Type\": \"Succeed\"\n    },\n    \"SucceedRejected\": {\n      \"Type\": \"Succeed\"\n    },\n    \"FailClosed\": {\n      \"Type\": \"Fail\",\n      \"Error\": \"FailClosed\",\n      \"Cause\": \"The evidence gate failed closed\"\n    }\n  }\n}\n",
+            {
+              "ValidateFunctionArn": {
+                "Fn::GetAtt": [
+                  "ValidateFunction",
+                  "Arn"
+                ]
+              },
+              "DiffFunctionArn": {
+                "Fn::GetAtt": [
+                  "DiffFunction",
+                  "Arn"
+                ]
+              },
+              "AnalyzeFunctionArn": {
+                "Fn::GetAtt": [
+                  "AnalyzeFunction",
+                  "Arn"
+                ]
+              },
+              "SpecCheckFunctionArn": {
+                "Fn::GetAtt": [
+                  "SpecCheckFunction",
+                  "Arn"
+                ]
+              },
+              "HarnessFunctionArn": {
+                "Fn::GetAtt": [
+                  "HarnessFunction",
+                  "Arn"
+                ]
+              },
+              "SealFunctionArn": {
+                "Fn::GetAtt": [
+                  "SealFunction",
+                  "Arn"
+                ]
+              },
+              "RegisterWaitFunctionArn": {
+                "Fn::GetAtt": [
+                  "RegisterWaitFunction",
+                  "Arn"
+                ]
+              },
+              "FinalizeFunctionArn": {
+                "Fn::GetAtt": [
+                  "FinalizeFunction",
+                  "Arn"
+                ]
+              },
+              "ExpireFunctionArn": {
+                "Fn::GetAtt": [
+                  "ExpireFunction",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        },
+        "LoggingConfiguration": {
+          "Destinations": [
+            {
+              "CloudWatchLogsLogGroup": {
+                "LogGroupArn": {
+                  "Fn::GetAtt": [
+                    "StateMachineLogGroup",
+                    "Arn"
+                  ]
+                }
+              }
+            }
+          ],
+          "IncludeExecutionData": false,
+          "Level": "ERROR"
+        },
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "StateMachineRole",
+            "Arn"
+          ]
+        },
+        "StateMachineName": {
+          "Ref": "ProjectName"
+        },
+        "StateMachineType": "STANDARD",
+        "TracingConfiguration": {
+          "Enabled": true
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ArtifactBucketName": {
+      "Value": {
+        "Ref": "ArtifactBucket"
+      }
+    },
+    "JobTableName": {
+      "Value": {
+        "Ref": "JobTable"
+      }
+    },
+    "MockApiEndpoint": {
+      "Value": {
+        "Fn::Sub": "https://${MockApi}.execute-api.${AWS::Region}.amazonaws.com/live"
+      }
+    },
+    "ReviewApiEndpoint": {
+      "Value": {
+        "Fn::Sub": "https://${ReviewApi}.execute-api.${AWS::Region}.amazonaws.com/live"
+      }
+    },
+    "StateMachineArn": {
+      "Value": {
+        "Ref": "ReviewStateMachine"
+      }
+    },
+    "WorkQueueUrl": {
+      "Value": {
+        "Ref": "WorkQueue"
+      }
+    }
+  }
+}

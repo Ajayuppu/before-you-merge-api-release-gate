@@ -1,0 +1,8 @@
+{
+  "name": "api-review-checker",
+  "description": "Custom code interpreter for the fixed specification checker. SANDBOX can reach AWS services including S3. It is not an air gap.",
+  "networkConfiguration": {
+    "networkMode": "SANDBOX"
+  },
+  "executionRoleArn": "__CODE_INTERPRETER_ROLE_ARN__"
+}

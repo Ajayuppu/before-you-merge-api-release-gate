@@ -1,0 +1,14 @@
+{
+  "version": "orders-v2-broken",
+  "response": {
+    "status": 200,
+    "body": {
+      "orders": [
+        {
+          "id": "ord-1",
+          "amount": "19.95"
+        }
+      ]
+    }
+  }
+}
