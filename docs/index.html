@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="description" content="A serverless AWS release gate that catches breaking OpenAPI changes before merge, validated in us-east-1 on November 14, 2026.">
+<title>Before You Merge: Catch Breaking API Changes with Amazon Bedrock, AgentCore, Amazon Q Developer, and a Serverless AWS Release Gate</title>
+<style>
+body{font-family:Georgia,'Times New Roman',serif;max-width:780px;margin:2em auto;padding:0 1em;line-height:1.6;color:#242424}
+h1,h2,h3{font-family:Helvetica,Arial,sans-serif;line-height:1.25}
+img{max-width:100%;height:auto}
+figure{margin:1.5em 0}
+figcaption{font-size:0.9em;color:#555;font-style:italic;margin-top:0.4em}
+pre{background:#f4f1ea;border:1px solid #e2ddd2;border-radius:6px;padding:0.9em 1em;overflow-x:auto;font-size:0.86em;line-height:1.45}
+code{font-family:Menlo,Consolas,monospace;font-size:0.9em} pre code{font-size:1em;background:transparent}
+hr{border:0;border-top:1px solid #ddd;margin:2em 0}
+</style>
+</head>
+<body>
+<h1>Before You Merge: Catch Breaking API Changes with Amazon Bedrock, AgentCore, Amazon Q Developer, and a Serverless AWS Release Gate</h1>
+<p><em>By Ajay Uppu</em></p>
+<p><em>Everything marked "observed" below was run in my own AWS account in <code>us-east-1</code> on November 14, 2026. Account IDs, API IDs, bucket suffixes and review nonces are blurred in every screenshot, and the account ID is written as <code>&lt;ACCOUNT_ID&gt;</code> (or <code>0444XXXXXXXX</code>) in text. Where something was only written and unit-tested, or only proposed, I say so in the same paragraph.</em></p>
+<p><em>Code: https://github.com/Ajayuppu/before-you-merge-api-release-gate (the guide was checked against commit <code>37567ae</code>, which has 72 tests; the AgentCore validation in Section 9 ran at <code>fc35e03</code>, and the two later commits, <code>9e702c8</code> for cleanup and <code>37567ae</code> for tracing, are described in Sections 12, 14 and 15).</em></p>
+<hr />
+<h2>1. The problem: a small diff that breaks every old client</h2>
+<p>A pull request can change an API in a way that still looks reasonable in review. Two lines of an OpenAPI document move, the diff is small, the reviewer approves, and old clients fail in production afterwards.</p>
+<p>The example I use through this whole guide is deliberately boring, because boring is what actually ships:</p>
+<ul>
+<li><code>GET /orders</code> returns <code>{"orders":[{"id":"ord-1","amount":19.95}],"next_cursor":null}</code>.</li>
+<li>In the <strong>broken</strong> candidate, <code>amount</code> changes from a JSON number to a string (<code>"19.95"</code>), and the required <code>next_cursor</code> property disappears from the page.</li>
+<li>In the <strong>corrected</strong> candidate, <code>amount</code> stays a number, <code>next_cursor</code> is back, and one optional field, <code>currency</code>, is added.</li>
+</ul>
+<p>An old client that reads <code>next_cursor</code> to page through orders, or does arithmetic on <code>amount</code>, breaks on the first candidate and keeps working on the second. A human reading a two-line OpenAPI diff can miss that. A deterministic check can't.</p>
+<p>This guide builds a release gate for that exact moment, on AWS, and then shows what it did when I ran it:</p>
+<ol>
+<li>A developer submits the old OpenAPI document, the candidate document, and a small <strong>declarative JSON fixture</strong> (data, never code) that describes what an old client expects.</li>
+<li>A serverless workflow runs a deterministic diff and a fixed, repository-owned old-client harness against a versioned mock API. Those two things, and only those two, decide <code>BLOCKED</code> or <code>PASS</code>.</li>
+<li>If the verdict is <code>BLOCKED</code>, the job never reaches a human approval step. If it is <code>PASS</code>, the job waits for a <strong>separately authenticated reviewer</strong> to approve the exact sealed evidence.</li>
+<li>Amazon Bedrock can explain the findings in plain language and propose declarative fixes. That text is advisory and non-authoritative: it is stored next to the evidence, never inside the verdict.</li>
+<li>Amazon Bedrock AgentCore provides a Gateway with Cedar policy (an allow-list of three read tools and no approve tool) and a Code Interpreter that runs a fixed checker.</li>
+<li>Amazon Q Developer is not a runtime dependency. I used its console chat for two design-review questions (Section 11); it did not write this code.</li>
+</ol>
+<p>Approval here records a review decision. It does <strong>not</strong> merge and it does <strong>not</strong> deploy anything.</p>
+<h3>What this guide will and will not claim</h3>
+<p>I kept three buckets strictly apart, and the guide labels each one as it goes:</p>
+<ul>
+<li><strong>Observed live in AWS</strong> (screenshots and captured output): the CloudFormation deploy, the broken job being <code>BLOCKED</code>, the corrected job waiting for review and then <code>APPROVED</code>, the replay and blocked-job rejections, the developer being denied the reviewer route, two Bedrock model-comparison runs, the end-to-end Bedrock advisory on a real job, the AgentCore enable and validate runs with their console views, the 72-test suite in CloudShell, console views of the deployed services, the tracing configuration and CloudWatch Transaction Search, and two answers from Amazon Q Developer in the console.</li>
+<li><strong>Tested locally</strong> (72 pytest tests, plus a local demo): the diff rules, the harness, evidence sealing, idempotency, crash and replay handling, DLQ separation, the AgentCore helper logic and many fail-closed edge cases. These use in-memory fakes and make no AWS calls.</li>
+<li><strong>Proposed or not done</strong>: an AgentCore <em>Runtime</em> hosting an advisory agent, the workflow running the Code Interpreter inside it (<code>SPEC_CHECK_MODE=agentcore</code>; the live workflow uses <code>in-process</code>), an X-Ray Trace Map that lists the services (it stayed empty), and the cleanup run. These are described but are not claimed as results.</li>
+</ul>
+<p>None of the numbers below are estimates: they are copied from output I captured.</p>
+<hr />
+<h2>2. Solution overview</h2>
+<p>The gate is a standard asynchronous serverless pipeline with a hard stop in the middle:</p>
+<ul>
+<li>A developer calls an IAM-authenticated <strong>Amazon API Gateway</strong> REST API. The <strong>submit Lambda</strong> validates and stores the three documents in <strong>Amazon S3</strong> and writes the job, an idempotency record and an outbox record to <strong>Amazon DynamoDB</strong> in a single transaction.</li>
+<li>A DynamoDB stream feeds a <strong>publisher Lambda</strong> that puts a <code>JobSubmitted</code> event on <strong>Amazon EventBridge</strong>. A rule sends it to an <strong>Amazon SQS</strong> work queue, which buffers bursts. A <strong>dispatcher Lambda</strong> reads the queue and starts an <strong>AWS Step Functions</strong> Standard execution with a deterministic, job-derived name.</li>
+<li>The state machine runs: <code>Validate → Diff → Analyze → SpecCheck → Harness → Seal → Gate</code>. The <code>Analyze</code> step is where Bedrock is called (when enabled). The <code>Harness</code> step calls a versioned mock API with SigV4 and runs fixed assertions.</li>
+<li><code>Gate</code> is a Step Functions <code>Choice</code>. Only <code>PASS</code> continues to <code>WaitForReview</code>, a <code>waitForTaskToken</code> task. Everything else ends in <code>MarkBlocked</code>.</li>
+<li>A reviewer calls <code>GET /jobs/{jobId}/review-context</code> and <code>POST /reviews</code> with a different IAM role. The review Lambda checks the reviewer role, the job state, the evidence hash, a one-time nonce and expiry, then sends the Step Functions callback. <code>Finalize</code> re-checks the sealed evidence before it writes <code>APPROVED</code>.</li>
+<li><strong>Amazon CloudWatch</strong> holds Lambda logs; Lambda functions use <strong>AWS X-Ray</strong> active tracing and the OpenTelemetry layer, which exports spans to the X-Ray OTLP endpoint (Section 12).</li>
+<li><strong>Amazon Bedrock AgentCore</strong> (Gateway, Policy, Code Interpreter) is enabled by a separate, optional script and is validated separately; the section on AgentCore says exactly how it relates to the main workflow.</li>
+</ul>
+<hr />
+<h2>3. Architecture</h2>
+<figure><img alt="Architecture diagram of the serverless API release gate" src="images/architecture.png" /><figcaption>Figure 1. The reference architecture drawn with official AWS Architecture Icons (4800×3280 PNG). Panel A is the developer workflow: Review API, Submit Lambda, EventBridge, SQS work queue, the starter (dispatcher) Lambda and Step Functions, with S3 and DynamoDB as the evidence store, a deterministic pass gate, and a separately authenticated human reviewer on the PASS branch; Panel B shows the AgentCore tool boundary and the CloudWatch and X-Ray support plane. Its AgentCore Runtime box is part of the design that I did not deploy (see Section 9); every other component was deployed and validated in us-east-1. No account details appear in it.</figcaption></figure>
+<h3>Trust boundaries</h3>
+<p>These are the boundaries the code enforces, and they are the reason the pipeline looks the way it does.</p>
+<ul>
+<li><strong>Developer API.</strong> May submit specs and a fixture, and read that caller's own job. It cannot name a reviewer and never receives a task token.</li>
+<li><strong>Reviewer API.</strong> May approve or reject the <em>current</em> sealed hash, nonce and job. It cannot approve a failing, missing, stale, expired or replayed result.</li>
+<li><strong>Deterministic diff and harness.</strong> The only things that set the verdict. They accept data, never uploaded code or a caller-supplied URL.</li>
+<li><strong>Amazon Bedrock Converse.</strong> Explains findings and proposes declarative edits when explicitly enabled. It cannot set the verdict or authenticate anyone.</li>
+<li><strong>AgentCore Gateway and Cedar policy.</strong> Permit three read-style tools (<code>read_artifacts</code>, <code>request_spec_check</code>, <code>read_test_results</code>). There is no permit for approve, merge or deploy.</li>
+<li><strong>AgentCore Code Interpreter.</strong> Runs a fixed checker text. Its result is corroboration, not the verdict. A <code>SANDBOX</code> interpreter can still reach some AWS services, so I do not call it an air gap.</li>
+<li><strong>Step Functions.</strong> Orders the steps and holds the callback. A task token is not an approval.</li>
+<li><strong>Amazon Q Developer.</strong> Answered two design questions for me in the console. It does not appear in the runtime path.</li>
+</ul>
+<hr />
+<h2>4. Services used, and what each one does here</h2>
+<ul>
+<li><strong>Amazon API Gateway (REST, <code>AWS_IAM</code>).</strong> Two REST APIs. The review API exposes <code>POST /jobs</code>, <code>GET /jobs/{jobId}</code>, <code>GET /jobs/{jobId}/report</code>, <code>GET /jobs/{jobId}/review-context</code> and <code>POST /reviews</code>. A second, mock API serves <code>GET /orders-v1/orders</code>, <code>GET /orders-v2-broken/orders</code> and <code>GET /orders-v2-corrected/orders</code>. No method is unauthenticated, including the mock routes.</li>
+<li><strong>AWS Lambda.</strong> 15 functions in the stack: submit, status, review, review-context, publisher, dispatcher, validate, diff, analyze, spec-check, harness, seal, register-wait, finalize and expire. Runtime Python 3.12.</li>
+<li><strong>AWS Step Functions (Standard).</strong> The release gate state machine in <code>cloud/statemachine.asl.json</code>.</li>
+<li><strong>Amazon EventBridge.</strong> A custom event bus (logical id <code>ReviewBus</code>, deployed under the name <code>api-review</code>) and a rule, <code>api-review-submitted</code>, that matches <code>JobSubmitted</code> from <code>api.review</code> and targets the work queue. The rule has its own delivery dead-letter queue.</li>
+<li><strong>Amazon SQS.</strong> A work queue (redrive after 5 receives, visibility timeout 182 seconds), a separate worker DLQ for failed processing, and a separate EventBridge delivery DLQ.</li>
+<li><strong>Amazon S3.</strong> A versioned, encrypted, public-access-blocked artifact bucket holding content-addressed specs and evidence, and a second small code bucket used by the deploy script.</li>
+<li><strong>Amazon DynamoDB.</strong> One table (<code>api-review-jobs</code>) with job, idempotency and outbox records, and a stream that feeds the publisher.</li>
+<li><strong>Amazon Bedrock (Converse API).</strong> The optional advisory step. Default model for the stack is Amazon Nova 2 Lite; I deployed it with Anthropic Claude Haiku 4.5 for the live end-to-end advisory, and compared five models.</li>
+<li><strong>Amazon Bedrock AgentCore.</strong> <em>Gateway</em> (MCP, IAM inbound auth), <em>Policy</em> (a policy engine in enforce mode with three Cedar permits), and <em>Code Interpreter</em> (<code>SANDBOX</code>). The <em>Runtime</em> is part of the design, not part of the validated result.</li>
+<li><strong>Amazon Q Developer.</strong> Not in the runtime path. I asked its console chat two design questions; the questions, short excerpts of its answers and how they compare with this design are in Section 11.</li>
+<li><strong>Amazon CloudWatch and AWS X-Ray.</strong> Each function has an explicit log group, <code>TracingConfig</code> set to <code>Active</code>, and the AWS OpenTelemetry layer, configured to export spans to the X-Ray OTLP endpoint (Section 12). The code does not import the maintenance-mode <code>aws-xray-sdk</code>. With the trace segment destination set to CloudWatch Logs, spans are stored in CloudWatch Transaction Search.</li>
+<li><strong>AWS IAM.</strong> Two caller roles (<code>ApiReviewDeveloper</code>, <code>ApiReviewReviewer</code>) and a scripted operator user, plus per-function execution roles and two AgentCore service roles.</li>
+</ul>
+<hr />
+<h2>5. Prerequisites</h2>
+<ul>
+<li>An AWS account and a region where API Gateway, Lambda, Step Functions, EventBridge, SQS, S3, DynamoDB, Bedrock and AgentCore are available. I used <code>us-east-1</code>.</li>
+<li>AWS CloudShell in that region (it already has the AWS CLI and Python). Everything in this guide ran there.</li>
+<li>Python 3.11 or newer for the local tests (the repository declares <code>requires-python &gt;= 3.11</code>). The local run in this guide used Python 3.13.5 and pytest 9.2.</li>
+<li>The current regional <strong>AWS Distro for OpenTelemetry Lambda layer</strong> ARN for Python. I used the public layer <code>arn:aws:lambda:us-east-1:615299751070:layer:AWSOpenTelemetryDistroPython:33</code>. The 12-digit number inside that ARN is the layer publisher's account, not mine. Look the ARN up again for your region and architecture before you deploy.</li>
+<li>Permission to create the stack, IAM roles and users, Bedrock model access for any model you want to try, and AgentCore resources. I ran as the account root user in CloudShell, which matters for one troubleshooting item below (root is not an accepted API caller, so the stack uses dedicated roles).</li>
+<li><code>pytest</code> for the tests: <code>pip install pytest</code>.</li>
+</ul>
+<p>Every script that creates or deletes resources refuses to run unless you set an explicit confirmation variable, so a stray paste cannot create anything:</p>
+<ul>
+<li><code>CONFIRM_DEPLOY=yes</code> for <code>scripts/deploy_cloudshell.sh</code></li>
+<li><code>CONFIRM_IDENTITIES=yes</code> for <code>scripts/setup_demo_identities.sh</code></li>
+<li><code>CONFIRM_AGENTCORE=yes</code> for <code>scripts/enable_agentcore.sh</code></li>
+<li><code>CONFIRM_VALIDATE=yes</code> for <code>scripts/validate_agentcore.sh</code></li>
+<li><code>CONFIRM_CLEANUP=yes</code> for <code>scripts/cleanup_cloudshell.sh</code></li>
+</ul>
+<hr />
+<h2>6. Step-by-step walkthrough</h2>
+<h3>Step 1. Clone the repository and run the tests</h3>
+<p>In CloudShell:</p>
+<pre><code class="language-bash">rm -rf ~/api-review &amp;&amp; git clone https://github.com/Ajayuppu/before-you-merge-api-release-gate ~/api-review &amp;&amp; cd ~/api-review &amp;&amp; git log --oneline -n 3 &amp;&amp; ls
+pip install pytest
+cd ~/api-review &amp;&amp; python3 -m pytest -q 2&gt;&amp;1 | tail -n 15
+</code></pre>
+<figure><img alt="CloudShell showing the repository clone, pip install of pytest and a passing pytest run" src="images/cloudshell-pytest-blurred.png" /><figcaption>Figure 2. CloudShell in <code>us-east-1</code> right after cloning the repository into <code>~/api-review</code>. The log shows the checkout at the initial commit (<code>cb5ff4b</code>), the file listing (<code>cloud</code>, <code>fixtures</code>, <code>guide.md</code>, <code>publishing</code>, <code>pyproject.toml</code>, <code>README.md</code>, <code>scripts</code>, <code>src</code>, <code>tests</code>), <code>pytest</code> installing, and the suite finishing at 100% with only passing dots. This was the first checkout, before the later fixes in this guide, so it is the original suite, not the final 72 (see the next figure). The account menu in the top-right corner is blurred.</figcaption></figure>
+<p>The final repository (commit <code>37567ae</code>) has 72 tests. I re-ran them locally for this guide (Python 3.13.5, pytest 9.2) and got <code>72 passed in 1.64s</code>. In CloudShell, in a virtual environment with pytest installed, the suite at commit <code>9e702c8</code> ("Empty versioned buckets on cleanup and record the live validation") printed <code>72 passed in 0.91s</code>:</p>
+<figure><img alt="CloudShell showing the git log line for 9e702c8 and 72 passed in 0.91s" src="images/cloud-pytest-fc35e03-blurred.png" /><figcaption>Figure 3. CloudShell in <code>us-east-1</code> with the one-line <code>git log</code> entry for commit <code>9e702c8</code> (<code>HEAD -&gt; main, origin/main, origin/HEAD</code>, "Empty versioned buckets on cleanup and record the live validation"), a progress line of dots ending at 100%, and <code>72 passed in 0.91s</code>. It proves the final suite passes in the same environment I deployed from, as opposed to the earlier checkout in the previous figure. The account menu is blurred.</figcaption></figure>
+<p>Per file, the 72 tests break down as: <code>test_local_reference.py</code> 26, <code>test_agentcore_setup.py</code> 13, <code>test_runtime_clients.py</code> 11, <code>test_advisory_parse.py</code> 4, <code>test_aws_demo_cli.py</code> 4, <code>test_cleanup_versions.py</code> 4, <code>test_advisory_report.py</code> 3, <code>test_cloud_handlers.py</code> 2, <code>test_compare_bedrock_models.py</code> 2, <code>test_dynamo_numbers.py</code> 2 and <code>test_template.py</code> 1.</p>
+<p>These tests call no AWS API. They cover the diff rules (including the request-versus-response direction), the harness, evidence sealing, idempotency, a crash after <code>StartExecution</code>, a crash before and after the review callback, the two DLQs being distinct, the policy mirror that denies authority and cross-job arguments, the Bedrock parser and report shaping, the AgentCore helper logic, the versioned-bucket cleanup helpers, and the CloudFormation template contract (including the tracing variables). They are evidence about the <em>logic</em>. The live steps below are what show it working in AWS.</p>
+<p>You can also run the local demo, which walks three orders journeys in memory:</p>
+<pre><code class="language-bash">bash scripts/run_local_tests.sh
+bash scripts/run_local_demo.sh
+</code></pre>
+<p>The demo output from my run (the local identity is an explicit simulation, never production auth, and the banner says so):</p>
+<pre><code class="language-text">apireview 1.0.0 local demo
+SIMULATION: this process is not production authentication and is not AWS IAM. Identity is taken from an explicit local principal, never from a reviewer field in the request body.
+
+== healthy ==
+status: WAITING_REVIEW
+verdict: PASS
+harnessPassed: True
+breakingFindingCount: 0
+checker.authoritative: False
+checker.ok: True
+checker.mode: in-process
+advisory.includedInVerdict: False
+review: APPROVED
+
+== broken ==
+status: BLOCKED
+verdict: BLOCKED
+harnessPassed: False
+breakingFindingCount: 2
+breaking response.property.removed.required: Removed response property next_cursor. It was required, so old clients that read it will break.
+breaking response.type.changed: Response type changed from number to string. Old clients that decode the previous JSON type will break.
+assertion failed amount: amount is str '19.95'; old clients require a JSON number and booleans are rejected
+assertion failed next_cursor: next_cursor is missing; old clients require the field
+checker.authoritative: False
+checker.ok: False
+checker.mode: in-process
+advisory.includedInVerdict: False
+review rejected: fail_closed: job is not waiting for review (BLOCKED)
+
+== corrected ==
+status: WAITING_REVIEW
+verdict: PASS
+harnessPassed: True
+breakingFindingCount: 0
+checker.authoritative: False
+checker.ok: True
+checker.mode: in-process
+advisory.includedInVerdict: False
+review: APPROVED
+
+executions started: 3
+</code></pre>
+<p>(The demo also prints an evidence hash per scenario; those change on every run because each job gets a random id, so I left them out.) This is the same story the cloud run tells later: healthy passes, broken is blocked and cannot be approved, corrected passes and can be approved once.</p>
+<h3>Step 2. Understand the three inputs</h3>
+<p>The repository ships three OpenAPI 3.0 documents under <code>fixtures/</code>, one declarative client fixture, and one mock response body per version. The fixture describes what an old client sends and expects. It is JSON and nothing else:</p>
+<pre><code class="language-json">{
+  &quot;fixtureVersion&quot;: &quot;1&quot;,
+  &quot;name&quot;: &quot;orders-old-client&quot;,
+  &quot;cases&quot;: [
+    {
+      &quot;id&quot;: &quot;list-orders&quot;,
+      &quot;method&quot;: &quot;GET&quot;,
+      &quot;path&quot;: &quot;/orders&quot;,
+      &quot;query&quot;: {},
+      &quot;expect&quot;: {
+        &quot;status&quot;: 200,
+        &quot;body&quot;: {
+          &quot;orders&quot;: [ { &quot;id&quot;: &quot;ord-1&quot;, &quot;amount&quot;: 19.95 } ],
+          &quot;next_cursor&quot;: null
+        },
+        &quot;requiredPaths&quot;: [&quot;orders&quot;, &quot;orders[0].id&quot;, &quot;orders[0].amount&quot;, &quot;next_cursor&quot;]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>The only difference between <code>orders-v1.openapi.json</code> and the <strong>broken</strong> candidate is three edits: <code>info.version</code> goes <code>1.0.0 → 2.0.0</code>, <code>amount.type</code> goes <code>number → string</code>, and <code>next_cursor</code> is removed from both <code>required</code> and <code>properties</code>. The <strong>corrected</strong> candidate differs from v1 by only <code>info.version</code> (<code>1.0.0 → 1.1.0</code>) and one added optional <code>currency</code> string. The mock API returns, for the broken version, a body with <code>"amount": "19.95"</code> and no <code>next_cursor</code>; for the corrected version, a numeric <code>19.95</code>, <code>next_cursor: null</code>, and <code>currency: "USD"</code>.</p>
+<p>The fixture is validated before use. Keys such as <code>code</code>, <code>script</code>, <code>url</code>, <code>callback</code>, <code>principal</code>, <code>reviewer</code>, <code>role</code> and <code>taskToken</code> are forbidden, and strings that look like <code>http://</code>, <code>https://</code>, <code>s3://</code> or <code>file://</code> are rejected (<code>limits.py</code>). Specs are limited to a documented OpenAPI 3.0 subset with local <code>#/components/schemas</code> references; external references are refused. JSON booleans are not treated as numbers (Python's <code>bool</code> is a subclass of <code>int</code>, and the code handles that), and money values are parsed as <code>Decimal</code>, so <code>19.95</code> never passes through binary floating point.</p>
+<h3>Step 3. The deterministic diff</h3>
+<p>The diff is the first of the two components that can set a verdict. The central idea is that <strong>compatibility has a direction</strong>. Removing a required <em>response</em> property breaks old clients. Adding a required <em>request</em> property breaks callers. Adding an optional response property breaks no one. The code keeps those rules separate:</p>
+<pre><code class="language-python">def _diff_object(old: Schema, new: Schema, path: str, direction: str, findings: list[dict[str, str]]) -&gt; None:
+    for name in sorted(set(old.properties) - set(new.properties)):
+        required = name in old.required
+        if direction == &quot;response&quot;:
+            rule = &quot;response.property.removed.required&quot; if required else &quot;response.property.removed.optional&quot;
+            _add(
+                findings,
+                severity=&quot;breaking&quot;,
+                rule=rule,
+                path=f&quot;{path}/properties/{name}&quot;,
+                message=(
+                    f&quot;Removed response property {name}. &quot;
+                    + (
+                        &quot;It was required, so old clients that read it will break.&quot;
+                        if required
+                        else &quot;It was optional, and old clients that read it can still break.&quot;
+                    )
+                ),
+            )
+        else:
+            _add(findings, severity=&quot;info&quot;, rule=&quot;request.property.removed&quot;,
+                 path=f&quot;{path}/properties/{name}&quot;,
+                 message=f&quot;Removed request property {name}. The server accepts a smaller caller payload.&quot;)
+    for name in sorted(set(new.properties) - set(old.properties)):
+        required = name in new.required
+        if direction == &quot;response&quot;:
+            rule = &quot;response.property.added.required&quot; if required else &quot;response.property.added.optional&quot;
+            ...  # severity &quot;info&quot;: old clients ignore a new response field
+        elif required:
+            _add(findings, severity=&quot;breaking&quot;, rule=&quot;request.property.added.required&quot;, ...)
+</code></pre>
+<p>A type change on a response schema produces <code>response.type.changed</code> with severity <code>breaking</code>. The test <code>test_request_and_response_required_directions_differ</code> locks the direction rules in.</p>
+<h3>Step 4. The trusted harness</h3>
+<p>The second verdict-setting component is the old-client harness. It runs fixed assertions that live in the repository. The fixture only supplies expected values; it is never executed. The cloud transport can call only the configured mock host and an allow-listed route for the selected version enum, with redirects disabled, a 3-second timeout and a 64 KiB response cap:</p>
+<pre><code class="language-python">def build_plan(mock_version: str, *, host: str, stage: str) -&gt; HarnessPlan:
+    if mock_version not in MOCK_VERSIONS:
+        raise ValidationFailed(&quot;mockVersion is not on the allowlist&quot;)
+    if not host or &quot;://&quot; in host or &quot;/&quot; in host or &quot; &quot; in host:
+        raise ValidationFailed(&quot;mock host must be a configured hostname, not a URL&quot;)
+    ...
+    path = CLOUD_MOCK_ROUTES[mock_version]
+    url = f&quot;https://{host}/{stage}{path}&quot;
+    parts = urlsplit(url)
+    if parts.scheme != &quot;https&quot; or parts.hostname != host or parts.query or parts.fragment:
+        raise ValidationFailed(&quot;mock URL failed the allowlist check&quot;)
+    ...
+    return HarnessPlan(mock_version=mock_version, target=MockTarget(..., allow_redirects=False))
+</code></pre>
+<p>The two assertions that matter for our example are <code>amount</code> and <code>next_cursor</code>:</p>
+<pre><code class="language-python">amount = order.get(&quot;amount&quot;)
+if isinstance(amount, bool) or not is_json_number(amount):
+    kind = type(amount).__name__
+    assertions.append(_assertion(&quot;amount&quot;, False,
+        f&quot;amount is {kind} {amount!r}; old clients require a JSON number and booleans are rejected&quot;))
+...
+present = &quot;next_cursor&quot; in body
+if not present:
+    assertions.append(_assertion(&quot;next_cursor&quot;, False,
+        &quot;next_cursor is missing; old clients require the field&quot;))
+</code></pre>
+<p>A truncated or incomplete harness result also fails closed: <code>complete</code> must be true, there must be at least one case, and every case must pass.</p>
+<h3>Step 5. Evidence sealing and the verdict function</h3>
+<p>After the harness runs, the <code>Seal</code> step builds an evidence bundle and hashes the canonical bytes of the whole thing: job id, both spec hashes, fixture hash, mock version, findings, harness result, checker summary, the advisory <em>hashes</em>, the agent trace and the verdict. Change any byte afterwards and the hash no longer matches.</p>
+<p>The verdict function is short enough to read in one screen, and the thing to notice is what is <em>not</em> a parameter:</p>
+<pre><code class="language-python">def authoritative_verdict(findings: list[dict[str, Any]], harness: dict[str, Any] | None) -&gt; str:
+    &quot;&quot;&quot;AI output is intentionally not a parameter.&quot;&quot;&quot;
+    if not harness or not harness.get(&quot;complete&quot;) or not harness.get(&quot;passed&quot;):
+        return &quot;BLOCKED&quot;
+    if not harness.get(&quot;cases&quot;):
+        return &quot;BLOCKED&quot;
+    if breaking_findings(findings):
+        return &quot;BLOCKED&quot;
+    return &quot;PASS&quot;
+</code></pre>
+<p>No model text, no checker result and no agent output can reach this function. The test <code>test_model_output_cannot_change_the_verdict</code> checks exactly that.</p>
+<h3>Step 6. The workflow definition</h3>
+<p>The state machine is a Step Functions Standard workflow. Each step retries transient Lambda errors with backoff and catches everything else into <code>FailClosed</code>. The part that implements the hard gate is small:</p>
+<pre><code class="language-json">&quot;Gate&quot;: {
+  &quot;Type&quot;: &quot;Choice&quot;,
+  &quot;Choices&quot;: [ { &quot;Variable&quot;: &quot;$.verdict&quot;, &quot;StringEquals&quot;: &quot;PASS&quot;, &quot;Next&quot;: &quot;WaitForReview&quot; } ],
+  &quot;Default&quot;: &quot;MarkBlocked&quot;
+},
+&quot;MarkBlocked&quot;: { &quot;Type&quot;: &quot;Succeed&quot; },
+&quot;WaitForReview&quot;: {
+  &quot;Type&quot;: &quot;Task&quot;,
+  &quot;Resource&quot;: &quot;arn:aws:states:::lambda:invoke.waitForTaskToken&quot;,
+  &quot;TimeoutSeconds&quot;: 3600,
+  &quot;Parameters&quot;: {
+    &quot;FunctionName&quot;: &quot;${RegisterWaitFunctionArn}&quot;,
+    &quot;Payload&quot;: {
+      &quot;evidenceHash.$&quot;: &quot;$.evidenceHash&quot;,
+      &quot;jobId.$&quot;: &quot;$.jobId&quot;,
+      &quot;taskToken.$&quot;: &quot;$$.Task.Token&quot;
+    }
+  },
+  &quot;ResultPath&quot;: &quot;$.review&quot;,
+  &quot;Catch&quot;: [
+    { &quot;ErrorEquals&quot;: [&quot;States.Timeout&quot;], &quot;ResultPath&quot;: &quot;$.error&quot;, &quot;Next&quot;: &quot;Expire&quot; },
+    { &quot;ErrorEquals&quot;: [&quot;States.ALL&quot;], &quot;ResultPath&quot;: &quot;$.error&quot;, &quot;Next&quot;: &quot;FailClosed&quot; }
+  ],
+  &quot;Next&quot;: &quot;Finalize&quot;
+}
+</code></pre>
+<p><code>MarkBlocked</code> is a <code>Succeed</code> state on purpose: recording a block is a <em>completed</em> workflow, not an approval. Anything that is not exactly <code>PASS</code> takes the default branch. The task token is handed to a Lambda that stores it server-side; it is never returned to a caller. After the reviewer's callback, <code>Finalize</code> re-checks the evidence and only then writes <code>APPROVED</code>.</p>
+<h3>Step 7. Intake, idempotency and the outbox</h3>
+<p>The submit Lambda makes one DynamoDB transaction that writes the job, an idempotency record keyed by caller and <code>Idempotency-Key</code>, and an outbox record. This closes the gap between "wrote the job" and "published the event":</p>
+<pre><code class="language-python">table.put_new(
+    [
+        (_job_pk(job_id), job),
+        (_idem_pk(principal.subject, idempotency_key),
+         {&quot;jobId&quot;: job_id, &quot;payloadHash&quot;: loaded.payload_hash, &quot;status&quot;: &quot;IDEMPOTENCY&quot;, &quot;subject&quot;: principal.subject}),
+        (_outbox_pk(event_id), {&quot;eventId&quot;: event_id, &quot;jobId&quot;: job_id, &quot;status&quot;: &quot;PENDING&quot;}),
+    ]
+)
+</code></pre>
+<p>Submitting the same key with the same payload returns the same job; the same key with a different payload returns a conflict. The caller identity comes from <code>requestContext.identity.userArn</code>, set by API Gateway's IAM authorization, and a body that tries to carry authority fields is rejected.</p>
+<p>The EventBridge rule and queue wiring in the generated template:</p>
+<pre><code class="language-json">&quot;SubmitRule&quot;: {
+  &quot;Type&quot;: &quot;AWS::Events::Rule&quot;,
+  &quot;Properties&quot;: {
+    &quot;EventBusName&quot;: { &quot;Ref&quot;: &quot;ReviewBus&quot; },
+    &quot;EventPattern&quot;: { &quot;detail-type&quot;: [&quot;JobSubmitted&quot;], &quot;source&quot;: [&quot;api.review&quot;] },
+    &quot;Targets&quot;: [ { &quot;Arn&quot;: { &quot;Fn::GetAtt&quot;: [&quot;WorkQueue&quot;, &quot;Arn&quot;] },
+                   &quot;DeadLetterConfig&quot;: { &quot;Arn&quot;: { &quot;Fn::GetAtt&quot;: [&quot;EventBridgeDlq&quot;, &quot;Arn&quot;] } },
+                   &quot;Id&quot;: &quot;WorkQueue&quot; } ]
+  }
+},
+&quot;WorkQueue&quot;: {
+  &quot;Type&quot;: &quot;AWS::SQS::Queue&quot;,
+  &quot;Properties&quot;: {
+    &quot;RedrivePolicy&quot;: { &quot;deadLetterTargetArn&quot;: { &quot;Fn::GetAtt&quot;: [&quot;WorkerDlq&quot;, &quot;Arn&quot;] }, &quot;maxReceiveCount&quot;: 5 },
+    &quot;VisibilityTimeout&quot;: 182
+  }
+}
+</code></pre>
+<p>The visibility timeout, 182 seconds, is <code>6 × 30 + 2</code>: six times the dispatcher's 30-second timeout plus its 2-second batch window, which is the documented rule for SQS-triggered Lambda. A test (<code>test_visibility_timeout_matches_the_documented_formula</code>) keeps the numbers in step. The EventBridge delivery DLQ and the worker redrive DLQ are different queues on purpose: one covers failed delivery into SQS, the other covers repeated failures in the dispatcher. EventBridge does not start the workflow; only the dispatcher does, after a conditional claim and with a deterministic execution name (<code>review-&lt;jobId&gt;</code>), so a replayed event cannot start a second logical run.</p>
+<h3>Step 8. Deploy the stack</h3>
+<p>This is the deploy command I used in CloudShell. The first attempt (below) piped to <code>tee ~/deploy.log</code>; for later redeploys I redirected to a numbered log, <code>&gt; ~/deployN.log 2&gt;&amp;1</code>, so I could grep it afterwards:</p>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; CONFIRM_DEPLOY=yes REGION=us-east-1 \
+  OTEL_LAYER_ARN='arn:aws:lambda:us-east-1:615299751070:layer:AWSOpenTelemetryDistroPython:33' \
+  bash scripts/deploy_cloudshell.sh 2&gt;&amp;1 | tee ~/deploy.log
+</code></pre>
+<p>The script packages the Lambda code (<code>build/lambda.zip</code>, 37 entries), regenerates <code>cloud/template.deploy.json</code>, creates a code bucket named <code>api-review-code-&lt;ACCOUNT_ID&gt;-us-east-1</code> if it is missing, uploads the zip under a content-addressed key, and runs <code>aws cloudformation deploy</code> with <code>CAPABILITY_IAM</code> and <code>--s3-bucket</code>:</p>
+<pre><code class="language-bash">CODE_KEY=&quot;api-review/lambda-$(sha256sum &quot;$ROOT/build/lambda.zip&quot; | cut -c1-16).zip&quot;
+...
+aws cloudformation deploy \
+  --region &quot;$REGION&quot; --stack-name &quot;$STACK&quot; \
+  --template-file &quot;$ROOT/cloud/template.deploy.json&quot; \
+  --capabilities CAPABILITY_IAM --s3-bucket &quot;${BUCKET}&quot; --s3-prefix api-review/templates \
+  --parameter-overrides \
+    &quot;LambdaCodeBucket=${BUCKET}&quot; &quot;LambdaCodeKey=${CODE_KEY}&quot; &quot;OtelLayerArn=${OTEL_LAYER_ARN}&quot; \
+    &quot;ProjectName=${PROJECT_NAME:-api-review}&quot; \
+    &quot;BedrockAdvisory=${BEDROCK_ADVISORY:-disabled}&quot; \
+    &quot;BedrockModelId=${BEDROCK_MODEL_ID:-us.amazon.nova-2-lite-v1:0}&quot; \
+    &quot;DeploymentNonce=${DEPLOYMENT_NONCE:-$(date +%s)}&quot;
+</code></pre>
+<p>My first attempt failed, and that is worth showing because it is the first thing you will hit too:</p>
+<figure><img alt="CloudShell showing the first deploy attempt failing because the template is larger than 51,200 bytes" src="images/cloudshell-deploy-blurred.png" /><figcaption>Figure 4. The first deploy attempt. The script packaged <code>build/lambda.zip</code> (37 entries), wrote <code>cloud/template.deploy.json</code>, uploaded the zip to the code bucket (the bucket suffix after <code>api-review-code-</code> is blurred), and then <code>aws cloudformation deploy</code> stopped with: "Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket. Please add the --s3-bucket parameter to your command." The command line above it shows the <code>CONFIRM_DEPLOY=yes</code> guard and the layer ARN. This is a real failure, not a staged one, and the account menu is blurred.</figcaption></figure>
+<p>The fix (commit <code>955fb9e</code>) is the <code>--s3-bucket</code> / <code>--s3-prefix</code> pair you see in the script above; the template upload in the successful run is 94,421 bytes.</p>
+<figure><img alt="CloudShell showing the CloudFormation stack created and the six stack outputs" src="images/cloudshell-deploy-success-blurred.png" /><figcaption>Figure 5. A successful deploy. The log shows the template uploaded to <code>api-review/templates/...</code> (94421 / 94421.0, 100.00%), "Waiting for changeset to be created", "Waiting for stack create/update to complete" and "Successfully created/updated stack - api-review". The <code>DescribeStacks</code> table lists the six outputs: <code>ArtifactBucketName</code>, <code>JobTableName</code> (<code>api-review-jobs</code>), <code>WorkQueueUrl</code>, <code>StateMachineArn</code>, <code>ReviewApiEndpoint</code> and <code>MockApiEndpoint</code>; the two API endpoints end in the <code>live</code> stage. Account IDs, the artifact bucket suffix and both API IDs are blurred.</figcaption></figure>
+<p>I redeployed several times while fixing the issues in the troubleshooting section (deploy logs <code>deploy7</code>, <code>deploy8</code> and <code>deploy9</code> all ended with <code>Successfully created/updated stack</code>). The check I used each time was:</p>
+<pre><code class="language-bash">grep 'Successfully created/updated stack' ~/deployN.log
+</code></pre>
+<h3>Step 9. Create the caller identities (and why you need them)</h3>
+<p>CloudShell runs as the account root user, and the API's IAM-based caller check rejects root: <code>POST /jobs</code> answered <code>authorization_failed</code> with "unsupported caller ARN shape" (see the troubleshooting section). So the repo includes a script that creates an operator IAM user and two roles, and writes CLI profiles for them:</p>
+<pre><code class="language-bash">CONFIRM_IDENTITIES=yes REGION=us-east-1 bash scripts/setup_demo_identities.sh
+</code></pre>
+<p>The roles are the whole point of role separation. The developer role may call <code>POST /jobs</code> and <code>GET /jobs/*</code>, and has an <strong>explicit deny</strong> on the two reviewer routes. The reviewer role may call only the reviewer routes:</p>
+<pre><code class="language-python">developer = {
+    &quot;Version&quot;: &quot;2012-10-17&quot;,
+    &quot;Statement&quot;: [
+        {&quot;Effect&quot;: &quot;Allow&quot;, &quot;Action&quot;: &quot;execute-api:Invoke&quot;,
+         &quot;Resource&quot;: [f&quot;{base}/live/POST/jobs&quot;, f&quot;{base}/live/GET/jobs/*&quot;]},
+        {&quot;Effect&quot;: &quot;Deny&quot;, &quot;Action&quot;: &quot;execute-api:Invoke&quot;,
+         &quot;Resource&quot;: [f&quot;{base}/live/GET/jobs/*/review-context&quot;, f&quot;{base}/live/POST/reviews&quot;]},
+    ],
+}
+reviewer = {
+    &quot;Version&quot;: &quot;2012-10-17&quot;,
+    &quot;Statement&quot;: [
+        {&quot;Effect&quot;: &quot;Allow&quot;, &quot;Action&quot;: &quot;execute-api:Invoke&quot;,
+         &quot;Resource&quot;: [f&quot;{base}/live/GET/jobs/*/review-context&quot;, f&quot;{base}/live/POST/reviews&quot;]},
+    ],
+}
+</code></pre>
+<p>The operator user can do exactly one thing: <code>sts:AssumeRole</code> on those two roles. The script writes three CLI profiles: <code>api-review-operator</code>, <code>api-review-developer</code> (session name <code>dev-ada</code>) and <code>api-review-reviewer</code> (session name <code>rev-ben</code>). Those session names show up in the ARNs in the screenshots below.</p>
+<p>On the Lambda side, the caller identity is read from the API Gateway request context only:</p>
+<pre><code class="language-python">context = event.get(&quot;requestContext&quot;)
+...
+user_arn = identity.get(&quot;userArn&quot;)
+...
+role_name = _role_name(user_arn)
+if not _role_allowed(role_name, expected_role_name):
+    raise AuthorizationFailed(&quot;caller IAM role is not allowed for this method&quot;)
+</code></pre>
+<p>and the review handler additionally refuses a reviewer who is the job's owner (<code>submitter cannot review their own job</code>).</p>
+<h3>Step 10. A failing (breaking) case: the broken candidate is BLOCKED</h3>
+<p>Submit the old document, the broken candidate and the fixture as the developer. The client script signs the request with SigV4 using the developer profile and saves the returned job id to <code>~/.api-review-last-job</code>:</p>
+<pre><code class="language-bash">python3 scripts/aws_demo.py --region us-east-1 --profile api-review-developer submit \
+  --old fixtures/orders-v1.openapi.json \
+  --new fixtures/orders-v2-broken.openapi.json \
+  --fixture fixtures/orders-client.fixture.json \
+  --mock-version orders-v2-broken \
+  --idempotency-key cloud-broken-0003
+python3 scripts/aws_demo.py --region us-east-1 --profile api-review-developer status --job-id last
+python3 scripts/aws_demo.py --region us-east-1 --profile api-review-developer report --job-id last
+</code></pre>
+<p>The idempotency key I used for the job below was <code>cloud-broken-0003</code>. You will see the line <code>profile cannot read stack outputs; the lookup used ambient credentials</code> in several screenshots. That is the script working as designed: it looks up the API endpoint from the stack outputs, the developer and reviewer roles deliberately cannot read CloudFormation, so that one lookup falls back to the ambient CloudShell credentials, while the request itself is still signed with the profile.</p>
+<p><strong>Result (job <code>job_d91438ad6d97f70467bd</code>):</strong> status <code>BLOCKED</code>, verdict <code>BLOCKED</code>, evidence hash <code>2ed375106473bd023752e7147bc01bb1d03a1ada2c9208188f5e6fada07ee75e</code>, with these findings:</p>
+<ul>
+<li><code>060d1de06bb5e2b6</code>, <code>info.version.changed</code>, severity <code>info</code>, <code>/info/version</code>: <code>1.0.0 → 2.0.0</code>.</li>
+<li><code>83ff6f7d10e433e2</code>, <code>response.property.removed.required</code>, severity <code>breaking</code>, <code>GET /orders</code>, property <code>next_cursor</code>: "Removed response property next_cursor. It was required, so old clients that read it will break."</li>
+<li><code>19f9694cfa9fe6d7</code>, <code>response.type.changed</code>, severity <code>breaking</code>, <code>GET /orders</code>, <code>orders[].amount</code>: <code>number → string</code>: "Old clients that decode the previous JSON type will break."</li>
+</ul>
+<figure><img alt="CloudShell report output for the broken job showing verdict BLOCKED and three findings" src="images/cloud-broken-job-blurred.png" /><figcaption>Figure 6. The report for the broken candidate, read from the deployed API in CloudShell. The JSON shows <code>"verdict": "BLOCKED"</code> and three findings with their ids, rules and JSON-pointer paths: the informational version bump, the removed required <code>next_cursor</code>, and the <code>amount</code> type change from number to string, both marked <code>breaking</code>. This proves the deterministic diff catches both breaks in AWS and that the job is blocked. The account menu at the top is blurred; the job's owner ARN is not in view.</figcaption></figure>
+<p>A blocked job never enters the human-review wait, so there is nothing for a reviewer to approve. I tested that directly in Step 13.</p>
+<h3>Step 11. The corrected candidate passes and waits for review</h3>
+<p>Same command shape, with the corrected document, the matching mock version and a new key (<code>cloud-corrected-0001</code>):</p>
+<pre><code class="language-bash">python3 scripts/aws_demo.py --region us-east-1 --profile api-review-developer submit \
+  --old fixtures/orders-v1.openapi.json \
+  --new fixtures/orders-v2-corrected.openapi.json \
+  --fixture fixtures/orders-client.fixture.json \
+  --mock-version orders-v2-corrected \
+  --idempotency-key cloud-corrected-0001
+</code></pre>
+<p><strong>Result (job <code>job_834a7b9a23c87ce25a83</code>):</strong> status <code>WAITING_REVIEW</code>, verdict <code>PASS</code>, evidence hash <code>c9075e51704fa7889e906dc0539ed2f588822f47a455417fe39368d74acbe551</code>. Its findings are the benign <code>info.version.changed</code> (<code>1.0.0 → 1.1.0</code>) and <code>875b695fc116389a</code>, <code>response.property.added.optional</code> for <code>currency</code>: "An optional additive response field is compatible with old clients."</p>
+<figure><img alt="CloudShell showing the corrected job in WAITING_REVIEW with verdict PASS" src="images/cloud-corrected-waiting-blurred.png" /><figcaption>Figure 7. The status response for the corrected candidate: <code>"authoritativeVerdict": "PASS"</code>, the evidence hash starting <code>c9075e51…</code>, <code>"mockVersion": "orders-v2-corrected"</code>, <code>"status": "WAITING_REVIEW"</code>, and an execution ARN named <code>review-job_834a7b9a23c87ce25a83</code>. The owner is <code>…assumed-role/ApiReviewDeveloper/dev-ada</code>. This shows a passing job stops at the human gate instead of auto-approving. The account ID inside the execution and owner ARNs is blurred.</figcaption></figure>
+<h3>Step 12. Review context and approval, by a different identity</h3>
+<p>The reviewer, under the reviewer profile, fetches the review context. This is the only call that returns the one-time nonce and expiry, and the submitter cannot see it. I saved the response to a file (note the <code>clear;</code> prefix I used on every CloudShell command, explained in troubleshooting):</p>
+<pre><code class="language-bash">clear; python3 scripts/aws_demo.py --region us-east-1 --profile api-review-reviewer \
+  review-context --job-id job_834a7b9a23c87ce25a83 | tee ~/review-context.json
+</code></pre>
+<figure><img alt="CloudShell showing a status call as the developer and a review-context call as the reviewer" src="images/cloud-review-context-blurred.png" /><figcaption>Figure 8. Two calls back to back: <code>status</code> as <code>api-review-developer</code> returns the <code>WAITING_REVIEW</code> job owned by <code>…assumed-role/ApiReviewDeveloper/dev-ada</code>, then <code>review-context</code> as <code>api-review-reviewer</code>, saved with <code>tee ~/review-context.json</code>, returns the evidence hash, <code>"status": "WAITING_REVIEW"</code>, <code>"verdict": "PASS"</code> and a <code>reviewExpiry</code> of <code>2026-11-14T17:33:33.743340+00:00</code> (12:33 PM ET). It proves the nonce is only handed to the reviewer role, bound to this job and this evidence. The <code>reviewNonce</code> and the account ID are blurred; the last finding of the report (the optional <code>currency</code> field) is visible above.</figcaption></figure>
+<p>The approval call binds the decision to the job, the exact evidence hash and the nonce:</p>
+<pre><code class="language-bash">python3 scripts/aws_demo.py --region us-east-1 --profile api-review-reviewer review \
+  --job-id job_834a7b9a23c87ce25a83 \
+  --evidence-hash &quot;$EVIDENCE_HASH&quot; \
+  --nonce &quot;$NONCE&quot; \
+  --decision approve \
+  --comment &quot;sealed evidence matches&quot;
+</code></pre>
+<p><code>EVIDENCE_HASH</code> and <code>NONCE</code> come from the saved review-context file. The server-side review handler does the following, in order:</p>
+<pre><code class="language-python">principal = principal_from_api_gateway(event, expected_role_name=REVIEWER_ROLE_NAME, ...)
+...
+if principal.subject == job[&quot;owner&quot;]:
+    raise AuthorizationFailed(&quot;submitter cannot review their own job&quot;)
+...
+if job[&quot;status&quot;] not in {&quot;WAITING_REVIEW&quot;, &quot;REVIEW_CALLBACK_PENDING&quot;}:
+    raise FailClosed(f&quot;job is not waiting for review ({job['status']})&quot;)
+if job.get(&quot;evidenceHash&quot;) != body.get(&quot;evidenceHash&quot;):
+    raise FailClosed(&quot;evidence hash does not match the sealed bundle&quot;)
+if job.get(&quot;reviewNonce&quot;) != body.get(&quot;nonce&quot;):
+    raise FailClosed(&quot;review nonce does not match this job&quot;)
+_recheck(job, blobs)          # rebuilds the seal from stored bytes and compares hashes
+...
+job = table.update(_job_pk(job[&quot;jobId&quot;]),
+    equals={&quot;status&quot;: &quot;WAITING_REVIEW&quot;, &quot;evidenceHash&quot;: job[&quot;evidenceHash&quot;], &quot;reviewNonce&quot;: job[&quot;reviewNonce&quot;]},
+    changes={&quot;decision&quot;: decision, &quot;reviewer&quot;: principal.subject, &quot;status&quot;: &quot;REVIEW_CALLBACK_PENDING&quot;, ...})
+sfn.send_task_success(taskToken=job[&quot;taskToken&quot;], output=canonical_dumps(output))
+</code></pre>
+<p>The conditional update is the one-time transition. <code>Finalize</code> then checks again that the callback payload still matches the job and the seal before writing <code>APPROVED</code>.</p>
+<p><strong>Observed result:</strong> the approve call returned <code>{"callback":"sent","status":"REVIEW_CALLBACK_PENDING"}</code>, and the final job status became <code>APPROVED</code> with verdict <code>PASS</code>. The <code>202</code> response is deliberately <em>not</em> "approved": the status stays <code>REVIEW_CALLBACK_PENDING</code> until <code>Finalize</code> has re-verified the evidence.</p>
+<figure><img alt="CloudShell showing the corrected job's final status APPROVED" src="images/cloud-approved-blurred.png" /><figcaption>Figure 9. The status of the corrected job after the reviewer's callback: <code>"authoritativeVerdict": "PASS"</code>, the same evidence hash (<code>c9075e51…</code>), the same execution ARN and <code>"status": "APPROVED"</code>. This shows approval landed only after the workflow finished, bound to the exact evidence that was sealed. Account IDs in the ARNs are blurred.</figcaption></figure>
+<h3>Step 13. Replay, blocked-job and role-separation checks (all fail closed)</h3>
+<p><strong>Replay.</strong> Sending the same approval a second time must not approve anything again:</p>
+<figure><img alt="CloudShell showing a replayed approval rejected and the job still APPROVED" src="images/cloud-replay-rejected-blurred.png" /><figcaption>Figure 10. The replayed approval returns <code>{"error": "fail_closed", "message": "job is not waiting for review (APPROVED)"}</code>. The "Post-replay status" below it still reads <code>"status": "APPROVED"</code> with the unchanged evidence hash and the same execution, so nothing was approved twice and nothing moved. The account ID inside the ARNs is blurred.</figcaption></figure>
+<p><strong>A blocked job cannot be approved.</strong> I called both reviewer endpoints for the <em>broken</em> job:</p>
+<figure><img alt="CloudShell showing review-context and review both rejected for the blocked job" src="images/cloud-blocked-conflict-blurred.png" /><figcaption>Figure 11. For the blocked job, both <code>review-context</code> and <code>review</code> answer <code>{"error": "fail_closed", "message": "job is not waiting for review (BLOCKED)"}</code>. A failing result has no review step to approve, which is the central promise of the gate. No account details are visible in this view.</figcaption></figure>
+<p><strong>The developer cannot use the reviewer route.</strong> The developer role has an explicit deny, and the call fails at API Gateway before any Lambda runs:</p>
+<figure><img alt="CloudShell showing the developer role denied the review-context route with an explicit deny" src="images/cloud-role-separation-blurred.png" /><figcaption>Figure 12. Calling <code>review-context</code> as <code>…assumed-role/ApiReviewDeveloper/dev-ada</code> returns API Gateway's message that the user "is not authorized to perform: execute-api:Invoke on resource: …/live/GET/jobs/job_834a7b9a23c87ce25a83/review-context with an explicit deny in an identity-based policy". That is the identity policy from Step 9 doing its job, not application code. The account ID and API ID in the message are blurred.</figcaption></figure>
+<p>At the end of these checks, Step Functions showed both executions as <code>SUCCEEDED</code> (the broken one ended in <code>MarkBlocked</code>, the corrected one in the approval path). A <code>list-rules</code> query on the <em>default</em> event bus for rules matching <code>api-review</code> returned none, which is consistent with the rule living on the custom <code>ReviewBus</code> in the template; I did not capture a <code>list-rules</code> for that bus, so I am not presenting it as evidence. What I can say is that the jobs moved from <code>RECEIVED</code> to terminal states, which requires the outbox, publisher, EventBridge, SQS, dispatcher and Step Functions path to have worked.</p>
+<p><strong>The local tests cover the cases I did not repeat live</strong>: wrong role and submitter-as-reviewer (<code>test_submitter_and_wrong_role_cannot_review</code>), a stale hash, a cross-job nonce and an expired review (<code>test_stale_hash_cross_job_nonce_and_expiry</code>), tampered findings (<code>test_tampered_findings_fail_closed</code>), same key with the same or a different payload (<code>test_idempotency_same_payload_and_conflict</code>), duplicate events starting one execution, a crash after <code>StartExecution</code>, a crash before and after the review callback, and the two DLQs being separate. Those are tested locally, not re-run in AWS.</p>
+<hr />
+<h2>7. The Amazon Bedrock advisory step, and why it is not authoritative</h2>
+<h3>What it does</h3>
+<p>The <code>Analyze</code> step always produces a <strong>deterministic advisory</strong> (plain explanations and declarative proposals built from the findings by repository code). When the stack parameter <code>BedrockAdvisory</code> is <code>enabled</code>, the same step also calls the Amazon Bedrock <strong>Converse</strong> API with the breaking findings and asks a model to explain them and propose fixes. The reply is parsed strictly, stored beside the deterministic advisory, and shown on the job report.</p>
+<p>The request the analyze function builds:</p>
+<pre><code class="language-python">def build_converse_request(model_id: str, findings: list[dict[str, str]]) -&gt; dict[str, Any]:
+    &quot;&quot;&quot;Bedrock Converse request. Reasoning stays off so maxTokens remains valid.&quot;&quot;&quot;
+    prompt = canonical_dumps({
+        &quot;task&quot;: &quot;explain-breaking-changes&quot;,
+        &quot;findings&quot;: [item for item in findings if item[&quot;severity&quot;] == &quot;breaking&quot;],
+    })
+    return {
+        &quot;modelId&quot;: model_id,
+        &quot;system&quot;: [{&quot;text&quot;: _SYSTEM}],
+        &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: [{&quot;text&quot;: prompt}]}],
+        &quot;inferenceConfig&quot;: {&quot;maxTokens&quot;: 1024, &quot;temperature&quot;: 0.0},
+        &quot;outputConfig&quot;: {&quot;textFormat&quot;: {&quot;type&quot;: &quot;json_schema&quot;, &quot;structure&quot;: {&quot;jsonSchema&quot;: {
+            &quot;name&quot;: &quot;advisory&quot;,
+            &quot;description&quot;: &quot;Explanations and proposals. Not a verdict.&quot;,
+            &quot;schema&quot;: _ADVISORY_SCHEMA}}}},
+    }
+</code></pre>
+<p>The system prompt tells the model to return one JSON object with two arrays, <code>explanations</code> (objects with a string <code>explanation</code>) and <code>proposals</code> (objects with a string <code>description</code>), and to leave out any verdict, approve, decision, principal, job id or code. Models that reject the structured-output field get the request again without it, and models that reject a system prompt get it folded into the user message (<code>_send_converse</code>). A transport or service error does not fail the job: it becomes a recorded <code>modelStatus: error</code> with the reason, and the deterministic advisory stays.</p>
+<h3>Why it can never decide</h3>
+<p>Four independent reasons, each one visible in code or output:</p>
+<ol>
+<li><strong>The verdict function has no parameter for it.</strong> <code>authoritative_verdict(findings, harness)</code> (Step 5) only sees findings and the harness result.</li>
+<li><strong>The sealed evidence marks it non-authoritative.</strong> The bundle's <code>advisory</code> block contains <code>"authoritative": False</code> and <code>"includedInVerdict": False</code>, plus only the <em>hashes</em> of the deterministic and model advisories.</li>
+<li><strong>The parser refuses authority-shaped content.</strong> Any key such as <code>code</code>, <code>script</code>, <code>command</code>, <code>verdict</code>, <code>approve</code>, <code>decision</code>, <code>principal</code> or <code>jobid</code>, and any string containing <code>http://</code>, <code>https://</code> or <code>s3://</code>, causes the whole reply to be rejected:</li>
+</ol>
+<pre><code class="language-python">def _safe_tree(value: Any) -&gt; bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                return False
+            lowered = key.lower()
+            if lowered in {&quot;code&quot;, &quot;script&quot;, &quot;command&quot;, &quot;verdict&quot;, &quot;approve&quot;, &quot;decision&quot;, &quot;principal&quot;, &quot;jobid&quot;}:
+                return False
+            if not _safe_tree(child):
+                return False
+        return True
+    ...
+</code></pre>
+<ol start="4">
+<li><strong>It is tested.</strong> <code>test_model_output_cannot_change_the_verdict</code>, <code>test_forbidden_content_is_rejected_and_error_matches_rejection</code> and <code>test_rejected_model_report_keeps_the_reason_and_the_block</code> all run in the suite.</li>
+</ol>
+<p>A suggestion from a model also never becomes executable: proposals are descriptions of a change to an OpenAPI document, not code.</p>
+<h3>Turning it on</h3>
+<p>I enabled the advisory by redeploying with two extra variables. This is the command I used for the end-to-end run (Anthropic Claude Haiku 4.5 through its US inference profile):</p>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; CONFIRM_DEPLOY=yes REGION=us-east-1 \
+  OTEL_LAYER_ARN='arn:aws:lambda:us-east-1:615299751070:layer:AWSOpenTelemetryDistroPython:33' \
+  BEDROCK_ADVISORY=enabled BEDROCK_MODEL_ID='us.anthropic.claude-haiku-4-5-20251001-v1:0' \
+  bash scripts/deploy_cloudshell.sh &gt; ~/deployN.log 2&gt;&amp;1
+grep 'Successfully created/updated stack' ~/deployN.log
+</code></pre>
+<p>Then confirm the Lambda's environment without changing anything:</p>
+<pre><code class="language-bash">aws lambda get-function-configuration --function-name api-review-analyze --query Environment.Variables
+</code></pre>
+<figure><img alt="CloudShell showing the analyze Lambda environment with BEDROCK_ADVISORY enabled and the Haiku 4.5 model id" src="images/cloud-analyze-env-blurred.png" /><figcaption>Figure 13. The environment of <code>api-review-analyze</code> after the advisory-enabled redeploy: <code>"BEDROCK_ADVISORY": "enabled"</code> and <code>"BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0"</code>. It also shows <code>"SPEC_CHECK_MODE": "in-process"</code>, <code>"LOCAL_IDENTITY_SIMULATION": "false"</code>, <code>"MOCK_STAGE": "live"</code>, <code>"REVIEW_TTL_SECONDS": "3600"</code>, <code>"JOB_TABLE_NAME": "api-review-jobs"</code>, <code>"OTEL_SERVICE_NAME": "api-review-analyze"</code>, <code>"AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"</code> and the OpenTelemetry propagators <code>xray,tracecontext</code>. The mock API host, the artifact bucket suffix and the account ID inside the state machine ARN are blurred.</figcaption></figure>
+<p>Note <code>SPEC_CHECK_MODE: in-process</code>. The deployed workflow ran the fixed checker in the Lambda, not in AgentCore Code Interpreter. I come back to that in Section 9.</p>
+<hr />
+<h2>8. Comparing third-party models on the advisory step</h2>
+<p>The question I wanted answered was practical: which Bedrock models, including ones from other providers, actually return the JSON this step needs, and what happens when a model is not available to my account? I wrote <code>scripts/compare_bedrock_models.py</code> for it. It calls <code>bedrock-runtime</code> <code>converse</code> with the <em>same request</em> the analyze function builds, a number of times per model (default 3), and records wall-clock latency, token usage, the stop reason, whether the reply parsed, and any error. <code>AccessDeniedException</code>, <code>ValidationException</code> and <code>ResourceNotFoundException</code> are stored against that model instead of stopping the run. Model text is never a verdict here either.</p>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; PYTHONPATH=src python3 scripts/compare_bedrock_models.py \
+  --region us-east-1 --report ~/broken-report.json --runs 3 --print-raw
+</code></pre>
+<p>The script reads the findings from a saved JSON report of the broken job (default <code>~/broken-report.json</code>), and writes <code>build/model-comparison.json</code> plus a markdown summary. In my CloudShell the script needed <code>PYTHONPATH=src</code> to import the repository package. In the tables below, "ok" means the call returned without a service error, and "parse ok" means the reply was accepted by the repository's parser. Latency is the median wall-clock time per call. For a refused call, that figure is just the time to the refusal, not model speed.</p>
+<h3>Run 1 (about 2:10 PM ET, commit <code>1097d92</code>, 3 runs per model)</h3>
+<ul>
+<li><code>us.anthropic.claude-sonnet-4-5-20250929-v1:0</code>: ok 0/3, median 168.764 ms, tokens n/a, parse ok 0/3.</li>
+<li><code>us.anthropic.claude-haiku-4-5-20251001-v1:0</code>: ok 3/3, median 3197.794 ms, median input/output tokens 227/471, parse ok 0/3.</li>
+<li><code>us.meta.llama3-3-70b-instruct-v1:0</code>: ok 0/3, median 126.378 ms, tokens n/a, parse ok 0/3.</li>
+<li><code>us.mistral.pixtral-large-2502-v1:0</code>: ok 3/3, median 3139.316 ms, tokens 250/210, parse ok 2/3.</li>
+<li><code>us.amazon.nova-2-lite-v1:0</code>: ok 3/3, median 1482.788 ms, tokens 238/206, parse ok 0/3.</li>
+</ul>
+<figure><img alt="CloudShell showing the first model comparison summary table" src="images/cloud-model-comparison-blurred.png" /><figcaption>Figure 14. The summary printed by the first comparison run, with the five models and their ok runs, median latency, median input/output tokens and parse results exactly as listed above, followed by "First advisory" sections that all read "(no parsed advisory)" and the line "wrote build/model-comparison.json". It shows that three models answered but none gave a usable parsed advisory in this first run, while two models were refused. No account details are in the terminal output; the account menu in the corner is blurred.</figcaption></figure>
+<p><strong>The two refusals were real, not a bug in the script.</strong> Sonnet 4.5 and Llama 3.3 70B both failed with a <code>ResourceNotFoundException</code>:</p>
+<pre><code class="language-text">Access denied. This Model is marked by provider as Legacy and you have not been actively using the model in the last 30 days.
+</code></pre>
+<p>This is a Bedrock model-lifecycle rule: a model marked Legacy by its provider is refused to an account that has not used it in the last 30 days. Before building any workflow on a model, run a quick call from the account that will use it.</p>
+<p>I also deployed the stack with Pixtral Large for the advisory (the only model with any parse success in run 1) and submitted the broken candidate. That deploy succeeded and the job (<code>job_61a4e2ed6087607bf6eb</code>) was <code>BLOCKED</code> as always, but the advisory was rejected:</p>
+<figure><img alt="CloudShell showing the first advisory report with modelStatus rejected" src="images/cloud-advisory-report-blurred.png" /><figcaption>Figure 15. The report of the Pixtral-backed job: the job is <code>BLOCKED</code> with <code>authoritativeVerdict</code> <code>BLOCKED</code>, and the <code>advisory</code> block says <code>"authoritative": false</code>, <code>"includedInVerdict": false</code>, <code>"modelStatus": "rejected"</code>, <code>"source": "deterministic-local"</code> and <code>"error": "model explanations or proposals were not arrays"</code>. The <code>evidenceAdvisory</code> block has a <code>deterministicHash</code> but <code>"modelAdvisoryHash": null</code>. It proves the pipeline records a rejected model reply, keeps the block, and falls back to the deterministic advisory instead of failing the job. The job id is visible; the account menu is blurred.</figcaption></figure>
+<p>That error pointed at the parser being too strict about the shape and wrapping of model output. I fixed the parser (commit <code>de60ed5</code>) so that it accepts a reply wrapped in a Markdown code fence, finds the first balanced JSON object if the model added prose, wraps a single object or string into a list, and renames a small set of known aliases (<code>summary</code>, <code>fix</code>, <code>suggestedFix</code> and similar) onto the two allowed fields. Unknown keys are dropped rather than failing the reply, but forbidden content inside the two arrays is still rejected:</p>
+<pre><code class="language-python">def parse_converse_response(response: dict[str, Any]) -&gt; dict[str, Any]:
+    try:
+        blocks = response[&quot;output&quot;][&quot;message&quot;][&quot;content&quot;]
+        texts = [block[&quot;text&quot;] for block in blocks if isinstance(block, dict) and &quot;text&quot; in block]
+        text = _strip_fences(&quot;&quot;.join(texts).strip())
+        parsed = _load_first_object(text)
+    except (KeyError, TypeError, json.JSONDecodeError, ValueError):
+        return _invalid(&quot;model output was not a JSON object&quot;)
+    ...
+    normalized = _normalize_keys(parsed)
+    explanations = _as_list(normalized.get(&quot;explanations&quot;, []))
+    proposals = _as_list(normalized.get(&quot;proposals&quot;, []))
+    if not isinstance(explanations, list) or not isinstance(proposals, list):
+        return _invalid(&quot;model explanations or proposals were not arrays&quot;)
+    if not _safe_tree(explanations) or not _safe_tree(proposals):
+        return _invalid(&quot;model output contained forbidden content&quot;)
+</code></pre>
+<p>I also tightened the system prompt and added the structured-output field to the request in the same commit, and replaced the two Legacy comparison models with Sonnet 4.6 and Llama 4 Maverick.</p>
+<h3>Run 2 (about 2:20 to 2:25 PM ET, commit <code>de60ed5</code>, 3 runs per model)</h3>
+<ul>
+<li><code>us.anthropic.claude-sonnet-4-6</code>: ok 0/3, median 115.354 ms, tokens n/a, parse ok 0/3.</li>
+<li><code>us.anthropic.claude-haiku-4-5-20251001-v1:0</code>: ok 3/3, median 1361.927 ms, tokens 576/149, parse ok 3/3.</li>
+<li><code>us.meta.llama4-maverick-17b-instruct-v1:0</code>: ok 0/3, median 146.086 ms, tokens n/a, parse ok 0/3.</li>
+<li><code>us.mistral.pixtral-large-2502-v1:0</code>: ok 3/3, median 1966.831 ms, tokens 304/137, parse ok 3/3.</li>
+<li><code>us.amazon.nova-2-lite-v1:0</code>: ok 3/3, median 1354.776 ms, tokens 283/197, parse ok 3/3.</li>
+</ul>
+<figure><img alt="CloudShell showing the second model comparison summary table" src="images/cloud-model-comparison-v2-blurred.png" /><figcaption>Figure 16. The summary of the second run: Haiku 4.5, Pixtral Large and Nova 2 Lite each answered 3 of 3 runs and parsed 3 of 3, while Sonnet 4.6 and Llama 4 Maverick show 0/3 with <code>n/a</code> tokens, and the "First advisory" section begins with Sonnet 4.6 reading "(no parsed advisory)". It proves the refusals were recorded per model instead of stopping the run. The top line is cut-off scrollback, no account details are visible, and the account menu is blurred.</figcaption></figure>
+<p><strong>The refusals in run 2 were also real results, and they are worth recording as results:</strong></p>
+<ul>
+<li><strong>Sonnet 4.6</strong> was refused with: <code>Model access is denied due to INVALID_PAYMENT_INSTRUMENT: A valid payment instrument must be provided.. Your AWS Marketplace subscription for this model cannot be completed at this time.</code> That is an account-level setup refusal for that model on my account, not a model-quality outcome.</li>
+<li><strong>Llama 4 Maverick</strong> was refused with the same Legacy access message as Llama 3.3 above.</li>
+</ul>
+<p>With <code>--print-raw</code>, the script also prints each model's reply. This is what the three models that answered said about the broken candidate (transcribed from the output):</p>
+<figure><img alt="CloudShell showing the first advisory text of each model that answered" src="images/cloud-model-comparison-v2-raw-blurred.png" /><figcaption>Figure 17. The "First advisory" section of the second run. Haiku 4.5, Pixtral Large and Nova 2 Lite each flag both breaks (the removed <code>next_cursor</code> and the <code>amount</code> change from number to string) in their own wording and propose restoring them, while Sonnet 4.6 and Llama 4 Maverick show "(no parsed advisory)". It proves the working models understood the findings, even though the verdict never depends on them. The last line, "## Raw replies", introduces the raw output; the account menu is blurred.</figcaption></figure>
+<ul>
+<li><strong>Haiku 4.5:</strong> explained that <code>next_cursor</code> had been removed from <code>GET /orders</code> and clients depending on it fail, and that <code>amount</code> changed from number to string and numeric clients break. Proposals: restore <code>next_cursor</code> or provide a deprecation period before removal; keep <code>amount</code> a number or run a gradual migration supporting both types.</li>
+<li><strong>Pixtral Large:</strong> explained that <code>next_cursor</code> was required and was removed, so older clients that rely on it fail, and that the type of <code>amount</code> changed from <code>number</code> to <code>string</code>, so older clients decoding it fail. Proposals: reinstate <code>next_cursor</code>; restore <code>amount</code> to <code>number</code>.</li>
+<li><strong>Nova 2 Lite:</strong> explained the same two breaks, referring to <code>orders.items.amount</code>. Proposals: add <code>next_cursor</code> back as a required property of a compatible type; change the <code>amount</code> type back to number, or introduce a new API version.</li>
+</ul>
+<p>All three correctly identified <em>both</em> breaking changes and proposed a restoration. The deterministic findings, not these paragraphs, are what blocked the job.</p>
+<p>One raw reply is also instructive, because it explains why the strict parser failed in run 1:</p>
+<figure><img alt="CloudShell showing a raw Nova 2 Lite reply wrapped in a json code fence" src="images/cloud-model-comparison-v2-raw2-blurred.png" /><figcaption>Figure 18. A raw Nova 2 Lite reply, run 1 of the second comparison. The reply begins with a Markdown code fence labeled json, then an object whose <code>explanations</code> array contains one object per break (<code>next_cursor</code> was removed and old clients will break; the type of <code>orders.items.amount</code> changed from number to string). It proves the model returned valid JSON wrapped in a code fence, which the original strict parser would not accept and the fixed parser does. Nothing sensitive is visible; the account menu is blurred.</figcaption></figure>
+<h3>How to read the two runs</h3>
+<ul>
+<li><strong>The refusals are the lesson.</strong> Out of the five models in each run, two were never usable from my account: in run 1 two Legacy models, in run 2 one Legacy model and one payment-instrument refusal. A comparison script that records the refusal per model is more useful than one that dies on the first error.</li>
+<li><strong>Three working models, three parseable JSON answers.</strong> In run 2, Haiku 4.5, Pixtral Large and Nova 2 Lite all parsed 3 of 3 times. In run 1 the same models parsed 0/3, 2/3 and 0/3 against the original strict parser. The request had also changed between runs (new system prompt and structured-output field), so the two runs are not a like-for-like latency benchmark. For example, Haiku's median output was 471 tokens in run 1 and 149 in run 2; I did not isolate the cause.</li>
+<li><strong>One oddity I did not explain.</strong> In run 1, Pixtral Large reported "parse ok 2/3", yet its "First advisory" section still printed "(no parsed advisory)". I have not traced why, and the parser has changed since.</li>
+<li><strong>Do not generalize these numbers.</strong> Three runs of one prompt on one input is a smoke test of "does it return usable JSON", not a quality benchmark.</li>
+</ul>
+<h3>Closing the loop: the advisory on a real job</h3>
+<p>After the comparison I submitted the broken candidate again with Haiku 4.5 enabled. Two further problems appeared, both visible in the screenshots.</p>
+<p>The first was a <strong>report that dropped the model text.</strong> The job showed <code>modelStatus: parsed</code> yet no explanations:</p>
+<figure><img alt="CloudShell showing a report with modelStatus parsed but no model text and source deterministic-local" src="images/cloud-advisory-report-v2-blurred.png" /><figcaption>Figure 19. An advisory block that says <code>"modelStatus": "parsed"</code>, <code>"authoritative": false</code>, <code>"includedInVerdict": false</code> and <code>"error": null</code>, but <code>"source": "deterministic-local"</code> and no explanation or proposal text, even though a model reply had been parsed; the job-level <code>authoritativeVerdict</code> printed above it is <code>BLOCKED BLOCKED</code>. It proves the model text was being dropped when the report was built, not rejected. The first line, <code>verdict None None</code>, is part of a quick inspection printout and not a report field, and nothing sensitive is in view.</figcaption></figure>
+<p>The cause (commit <code>f0e6102</code>) was that the report shaping copied only <code>source</code>, <code>modelStatus</code> and <code>error</code> and dropped the parsed text, which the merge step had stored under <code>modelExplanations</code> and <code>modelProposals</code>. The fix is in <code>report_advisory</code>:</p>
+<pre><code class="language-python">if status == &quot;parsed&quot;:
+    return {
+        &quot;authoritative&quot;: False,
+        &quot;error&quot;: None,
+        &quot;explanations&quot;: advisory.get(&quot;modelExplanations&quot;, []),
+        &quot;includedInVerdict&quot;: False,
+        &quot;modelAdvisoryHash&quot;: advisory.get(&quot;modelAdvisoryHash&quot;),
+        &quot;modelId&quot;: advisory.get(&quot;modelId&quot;) or model_id,
+        &quot;modelStatus&quot;: &quot;parsed&quot;,
+        &quot;proposals&quot;: advisory.get(&quot;modelProposals&quot;, []),
+        &quot;source&quot;: advisory.get(&quot;modelSource&quot;) or &quot;bedrock-converse&quot;,
+    }
+</code></pre>
+<p>The second was a <strong>mistyped job id</strong> (a CloudShell typing problem, covered in troubleshooting): a job I submitted for this run answered <code>not_found</code> on <code>status</code> and <code>report</code> because the id I typed was not the id that had been returned (<code>job_63b4574b6378286872e1</code> is the real one; the mistyped one began <code>job_63b5474b</code>). I fixed my workflow by never typing job ids again: <code>scripts/aws_demo.py</code> now saves the last submitted id to <code>~/.api-review-last-job</code> and accepts <code>--job-id last</code>.</p>
+<p><strong>End-to-end result</strong> (deploy <code>deploy8</code>, commit <code>f0e6102</code>, about 2:52 PM ET). Job <code>job_79fc043cf2b109f42aea</code> (idempotency key <code>cloud-broken-advisory-0004</code>) came back <code>BLOCKED</code> with <code>authoritativeVerdict</code> <code>BLOCKED</code>, and an advisory with source <code>bedrock-converse</code>, model <code>us.anthropic.claude-haiku-4-5-20251001-v1:0</code>, <code>modelStatus</code> <code>parsed</code>, <code>authoritative</code> false, <code>includedInVerdict</code> false and <code>modelAdvisoryHash</code> <code>abc9415047ad0838ddc40cd98a52dbd755db6e55c46ced3fee574dfb6f962f52</code>.</p>
+<figure><img alt="CloudShell showing the parsed Bedrock advisory for the broken job with explanations and proposals" src="images/cloud-advisory-report-v3-blurred.png" /><figcaption>Figure 20. The final advisory on job <code>job_79fc043cf2b109f42aea</code>: status <code>BLOCKED</code>, verdict <code>BLOCKED</code>, two explanations (the required <code>next_cursor</code> removed from <code>GET /orders</code>; <code>amount</code> changed from number to string), two proposals (restore <code>next_cursor</code> or deprecate it first; keep <code>amount</code> numeric or migrate gradually), <code>"authoritative": false</code>, <code>"includedInVerdict": false</code>, <code>"modelStatus": "parsed"</code>, <code>"modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0"</code>, <code>"source": "bedrock-converse"</code> and the <code>modelAdvisoryHash</code>. It proves the model text reaches the report while the verdict stays the deterministic <code>BLOCKED</code>. No account details are visible and the account menu is blurred.</figcaption></figure>
+<hr />
+<h2>9. Amazon Bedrock AgentCore: Gateway, Policy and Code Interpreter</h2>
+<h3>How this relates to the main workflow (read this first)</h3>
+<p>AgentCore is <strong>optional</strong> in this project and is enabled and validated by its own scripts. In the live run:</p>
+<ul>
+<li>The AgentCore <strong>Gateway</strong> (MCP), the <strong>Policy</strong> engine with three Cedar permits, and the <strong>Code Interpreter</strong> were created and validated against the deployed review API.</li>
+<li>The deployed state machine still had <code>SPEC_CHECK_MODE=in-process</code> (Figure 13). The workflow's own <code>SpecCheck</code> step ran the fixed checker inside the Lambda. The Code Interpreter was exercised by the validation script, not by the workflow.</li>
+<li>The <code>Analyze</code> step's "bounded agent" is the in-process tool gateway in <code>src/apireview/agent_boundary.py</code>, a <strong>local policy mirror</strong> that permits the same three tools. It is not the Cedar evaluator.</li>
+<li>An AgentCore <strong>Runtime</strong> hosting an advisory agent is part of the architecture's design and is <strong>not deployed</strong> in this run. The enable script ends by printing "Set the runtime to call only read_artifacts, request_spec_check, and read_test_results. Do not add an approve, merge, or deploy tool."</li>
+</ul>
+<p>So what I can show as evidence is that the three AgentCore building blocks deploy, are policy-enforced, and behave correctly under the allow and deny cases below. What I cannot show is a Runtime-hosted agent driving the workflow.</p>
+<h3>The three tools, and the one that is there to be denied</h3>
+<p>The gateway target <code>ReviewTools</code> is an API Gateway target pointing at the review API's <code>live</code> stage, and it maps three read-style tools to routes:</p>
+<ul>
+<li><code>read_artifacts</code> → <code>GET /jobs/{jobId}</code></li>
+<li><code>read_test_results</code> → <code>GET /jobs/{jobId}/report</code></li>
+<li><code>request_spec_check</code> → <code>POST /jobs</code></li>
+</ul>
+<pre><code class="language-python">&quot;toolOverrides&quot;: [
+  {&quot;name&quot;: &quot;read_artifacts&quot;,     &quot;path&quot;: &quot;/jobs/{jobId}&quot;,        &quot;method&quot;: &quot;GET&quot;,  &quot;description&quot;: &quot;Read one job. Not a verdict.&quot;},
+  {&quot;name&quot;: &quot;read_test_results&quot;,  &quot;path&quot;: &quot;/jobs/{jobId}/report&quot;, &quot;method&quot;: &quot;GET&quot;,  &quot;description&quot;: &quot;Read the sealed report and harness results. Not a verdict.&quot;},
+  {&quot;name&quot;: &quot;request_spec_check&quot;, &quot;path&quot;: &quot;/jobs&quot;,                &quot;method&quot;: &quot;POST&quot;, &quot;description&quot;: &quot;Submit a job for the fixed checker. Not a verdict.&quot;},
+  {&quot;name&quot;: &quot;approve&quot;,            &quot;path&quot;: &quot;/reviews&quot;,             &quot;method&quot;: &quot;POST&quot;, &quot;description&quot;: &quot;Review callback. Cedar default deny must block this tool.&quot;},
+],
+</code></pre>
+<p>The fourth tool, <code>approve</code>, is registered <strong>only so that validation can prove it is denied</strong>. No permit exists for it, so Cedar's default deny blocks it, and under enforcement it does not even show up in <code>tools/list</code>. Two more layers sit behind that: the gateway's IAM role has an explicit IAM <code>Deny</code> on the review-context and reviews routes, and the review Lambda separately demands the reviewer role. The runtime is meant to be told to use the three read tools only.</p>
+<p>Tool and action ids use the gateway's naming convention <code>&lt;target&gt;___&lt;tool&gt;</code> (three underscores), for example <code>ReviewTools___read_artifacts</code>.</p>
+<h3>Step 14. Enable AgentCore</h3>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; CONFIRM_AGENTCORE=yes REGION=us-east-1 bash scripts/enable_agentcore.sh 2&gt;&amp;1 | tee ~/agentcore-enable.log
+</code></pre>
+<p><code>enable</code> does the following, in this order (from <code>agentcore_setup.py</code>):</p>
+<ol>
+<li>Checks that the installed boto3 (1.43.83 in CloudShell) supports the AgentCore control and data planes.</li>
+<li>Creates or updates two IAM roles: <code>ApiReviewCodeInterpreter</code> and <code>ApiReviewGateway</code>. Both trust the <code>bedrock-agentcore.amazonaws.com</code> service principal with <code>aws:SourceAccount</code> and an <code>aws:SourceArn</code> of <code>arn:aws:bedrock-agentcore:&lt;region&gt;:&lt;ACCOUNT_ID&gt;:*</code>.</li>
+<li>Creates (or finds) the Code Interpreter <code>ApiReviewChecker</code> with <code>networkMode: SANDBOX</code>.</li>
+<li>Creates (or finds) the policy engine <code>ApiReviewPolicy</code> ("Read-only tools for the API review gateway.").</li>
+<li>Creates (or reuses) the gateway <code>ApiReviewTools</code> with <code>authorizerType=AWS_IAM</code>, <code>protocolType=MCP</code> and the policy engine attached in <code>ENFORCE</code> mode.</li>
+<li>Creates or updates the target <code>ReviewTools</code> and waits until it is ready.</li>
+<li>Grants <code>bedrock-agentcore:InvokeGateway</code> on that gateway to <code>ApiReviewDeveloper</code> and <code>ApiReviewReviewer</code>.</li>
+<li>Creates three Cedar permits, one per allowed tool, and waits for each to be <code>ACTIVE</code>.</li>
+<li>Writes the ids to <code>build/agentcore-ids.json</code> (used by validate and teardown).</li>
+</ol>
+<p>The service-role trust policy, and the gateway role's permission policy, as written in the script:</p>
+<pre><code class="language-python">def trust_policy(account, region, source_arn):
+    return {&quot;Version&quot;: &quot;2012-10-17&quot;, &quot;Statement&quot;: [{
+        &quot;Sid&quot;: &quot;AllowBedrockAgentCoreAssumeRole&quot;, &quot;Effect&quot;: &quot;Allow&quot;,
+        &quot;Principal&quot;: {&quot;Service&quot;: &quot;bedrock-agentcore.amazonaws.com&quot;}, &quot;Action&quot;: &quot;sts:AssumeRole&quot;,
+        &quot;Condition&quot;: {&quot;StringEquals&quot;: {&quot;aws:SourceAccount&quot;: account},
+                      &quot;ArnLike&quot;: {&quot;aws:SourceArn&quot;: source_arn}}}]}
+
+# gateway role: GetPolicyEngine; AuthorizeAction + PartiallyAuthorizeActions;
+# execute-api:Invoke on GET /jobs, GET /jobs/*, POST /jobs;
+# explicit Deny on GET /jobs/*/review-context and POST /reviews
+</code></pre>
+<p>And the Cedar permit that the script renders for each tool. One role, one action, one gateway:</p>
+<pre><code class="language-python">def permit_statement(gateway_arn: str, action: str, principal_id: str) -&gt; str:
+    return (
+        &quot;permit (\n&quot;
+        &quot;  principal is AgentCore::IamEntity,\n&quot;
+        f'  action == AgentCore::Action::&quot;{action}&quot;,\n'
+        f'  resource == AgentCore::Gateway::&quot;{gateway_arn}&quot;\n'
+        &quot;)\n&quot;
+        &quot;when {\n&quot;
+        f'  principal.id like &quot;{principal_id}*&quot;\n'
+        &quot;};\n&quot;
+    )
+</code></pre>
+<p>with <code>principal_id</code> set to <code>arn:aws:sts::&lt;ACCOUNT_ID&gt;:assumed-role/ApiReviewDeveloper</code> (Cedar evaluates the role without the session name, and the trailing <code>*</code> also matches a session suffix). Policies are created with <code>validationMode="FAIL_ON_ANY_FINDINGS"</code>, so a permit that Cedar validation flags does not become active.</p>
+<figure><img alt="CloudShell output of a completed enable_agentcore run showing roles, gateway, target, grants and three ACTIVE Cedar permits" src="images/cloud-agentcore-enable-blurred.png" /><figcaption>Figure 21. A completed run of <code>enable_agentcore.sh</code> (the idempotent re-run that produced the final state). It reports the boto3 version check, roles <code>ApiReviewCodeInterpreter</code> and <code>ApiReviewGateway</code> updated, Code Interpreter <code>ApiReviewChecker</code>, policy engine <code>ApiReviewPolicy</code> and gateway <code>ApiReviewTools</code> already existing, and the target <code>ReviewTools</code> updated with the tools <code>read_artifacts</code>, <code>read_test_results</code>, <code>request_spec_check</code> and <code>approve</code>. It then shows <code>bedrock-agentcore:InvokeGateway</code> granted to <code>ApiReviewDeveloper</code> and <code>ApiReviewReviewer</code>, and the three permits <code>AllowReadArtifacts</code>, <code>AllowRequestSpecCheck</code> and <code>AllowReadTestResults</code> each at <code>status=ACTIVE enforcement=ACTIVE statusReasons=none</code>, with statements that use <code>principal is AgentCore::IamEntity</code> and a <code>when</code> clause matching <code>…assumed-role/ApiReviewDeveloper*</code>. It ends with the reminder to limit the runtime to the three read tools and "Do not add an approve, merge, or deploy tool." The account ID, the gateway and code-interpreter id suffixes, and the username in the ARNs are blurred.</figcaption></figure>
+<h3>Step 15. Validate: allow, deny, wrong identity, Code Interpreter</h3>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; CONFIRM_VALIDATE=yes REGION=us-east-1 bash scripts/validate_agentcore.sh 2&gt;&amp;1 | tee ~/agentcore-validate.log
+</code></pre>
+<p>Validate checks four things, each printed as <code>PASS</code> or <code>FAIL</code>:</p>
+<ul>
+<li><strong><code>gateway-read</code></strong>: as the <code>api-review-developer</code> profile (role <code>ApiReviewDeveloper</code>, session <code>dev-ada</code>), call <code>tools/call</code> on <code>ReviewTools___read_artifacts</code> for the last job id (read from <code>~/.api-review-last-job</code>). It passes only on a real, non-error result.</li>
+<li><strong><code>policy-deny</code></strong>: with the same developer identity, call <code>ReviewTools___approve</code>. It passes only when the response is a policy denial.</li>
+<li><strong><code>other-identity</code></strong>: as the <strong>reviewer</strong> profile (<code>ApiReviewReviewer</code>, session <code>rev-ben</code>), call <code>read_artifacts</code>. It passes only when that call is <strong>denied</strong>: the Cedar permits are scoped to the developer role, so the reviewer is refused even though it has <code>InvokeGateway</code>.</li>
+<li><strong><code>code-interpreter diff</code></strong>: start a Code Interpreter session on <code>ApiReviewChecker</code>, run the fixed checker source against the <em>broken</em> spec, read the output stream, and stop the session in a <code>finally</code>. It passes only if the checker returned <code>ok: false</code> and flagged both <code>checker.amount.type</code> and <code>checker.next_cursor.required</code>. In other words, <code>PASS</code> means the interpreter correctly caught the broken candidate.</li>
+</ul>
+<p>The log from the validation run (account masked as <code>0444XXXXXXXX</code>):</p>
+<pre><code class="language-text">boto3 1.43.83 supports AgentCore control and data plane.
+ambient caller arn:aws:iam::0444XXXXXXXX:root
+gateway caller profile api-review-developer role ApiReviewDeveloper
+Gateway target ReviewTools is READY.
+policy AllowReadArtifacts status=ACTIVE enforcement=ACTIVE statusReasons=none
+policy AllowRequestSpecCheck status=ACTIVE enforcement=ACTIVE statusReasons=none
+policy AllowReadTestResults status=ACTIVE enforcement=ACTIVE statusReasons=none
+job id from /home/cloudshell-user/.api-review-last-job job_79fc043cf2b109f42aea
+gateway caller arn:aws:sts::0444XXXXXXXX:assumed-role/ApiReviewDeveloper/dev-ada
+tools/list -&gt; ReviewTools___read_artifacts, ReviewTools___read_test_results, ReviewTools___request_spec_check
+PASS gateway-read ReviewTools___read_artifacts
+PASS policy-deny ReviewTools___approve
+other caller arn:aws:sts::0444XXXXXXXX:assumed-role/ApiReviewReviewer/rev-ben
+PASS other-identity ReviewTools___read_artifacts
+PASS code-interpreter diff
+PASS agentcore-validation
+</code></pre>
+<p>Two details matter here. First, <code>tools/list</code> returns only the three read tools: with the policy engine in enforcement, the gateway lists only tools that an ACTIVE permit allows, so <code>approve</code> is hidden from the listing as well as denied when called. Second, the "ambient caller" is the root user of CloudShell, which is <em>not</em> the gateway caller: all gateway calls are made through the developer and reviewer profiles.</p>
+<figure><img alt="Compact CloudShell view of the AgentCore validate PASS lines" src="images/cloud-agentcore-validate-blurred.png" /><figcaption>Figure 22. The compact view of the validate result: the ambient root caller, the developer profile, <code>PASS gateway-read ReviewTools___read_artifacts</code> as <code>dev-ada</code>, <code>PASS policy-deny ReviewTools___approve</code>, the other caller <code>…assumed-role/ApiReviewReviewer/rev-ben</code> with <code>PASS other-identity ReviewTools___read_artifacts</code>, <code>PASS code-interpreter diff</code> and <code>PASS agentcore-validation</code>. It proves the allow, the policy denial, the wrong-identity denial and the interpreter check in one screen. The account ID portions of the ARNs are blurred.</figcaption></figure>
+<figure><img alt="Full CloudShell validate log showing the policies, tools/list and every PASS line" src="images/cloud-agentcore-validate-detail-blurred.png" /><figcaption>Figure 23. The full validate log: the boto3 probe, target <code>ReviewTools</code> READY, the three ACTIVE permits with their Cedar statements, job id <code>job_79fc043cf2b109f42aea</code> read from <code>~/.api-review-last-job</code>, the <code>tools/list</code> response listing only <code>read_artifacts</code>, <code>read_test_results</code> and <code>request_spec_check</code> (each with the description "…Not a verdict."), and then all PASS lines through <code>PASS agentcore-validation</code>. It shows the entire chain, from policy state to the final result, in a single capture. Account IDs and the gateway id suffix in the Cedar resource strings are blurred.</figcaption></figure>
+<h3>The AgentCore console, for the same resources</h3>
+<p>The same state, from the AgentCore console:</p>
+<figure><img alt="AgentCore console page for the ApiReviewTools gateway" src="images/cloud-agentcore-console-gateway-blurred.png" /><figcaption>Figure 24. The Amazon Bedrock AgentCore console page for gateway <code>ApiReviewTools</code>: status Ready, description "MCP gateway for the three read-only review tools", inbound auth type IAM permissions, policy engine enforcement mode Enforced with the associated policy engine <code>ApiReviewPolicy</code>, and the IAM role <code>ApiReviewGateway</code>. The Associated policies section lists <code>AllowReadTestResults</code>, <code>AllowRequestSpecCheck</code> and <code>AllowReadArtifacts</code>, last updated November 14, 2026 at 15:47 (UTC-05:00, which is ET). It proves the gateway is IAM-authenticated and policy-enforced in the console, not just in my script's output. The account ID, the gateway id and URL suffixes and the role ARN prefix are blurred.</figcaption></figure>
+<figure><img alt="AgentCore console page for the ApiReviewPolicy policy engine" src="images/cloud-agentcore-console-policy-blurred.png" /><figcaption>Figure 25. The policy engine <code>ApiReviewPolicy</code>: description "Read-only tools for the API review gateway.", status Active, 3 policies, and the associated gateway <code>apireviewtools</code> with enforcement mode Enforced. The Policies table shows <code>AllowReadTestResults</code>, <code>AllowRequestSpecCheck</code> and <code>AllowReadArtifacts</code>, each "Active" with the status "Active (Verified)", scoped to <code>apireviewtools</code>. It shows the permits passed validation and are in force, and that there are exactly three. The account ID inside the policy engine ARN is blurred.</figcaption></figure>
+<figure><img alt="AgentCore console page for the AllowReadTestResults Cedar policy" src="images/cloud-agentcore-console-policy2-blurred.png" /><figcaption>Figure 26. The definition of <code>AllowReadTestResults</code> in the console: effect <code>permit</code>, principal scope <code>AgentCore::IamEntity</code>, action <code>AgentCore::Action::"ReviewTools___read_test_results"</code>, resource the <code>apireviewtools</code> gateway. The Cedar tab shows the full statement, including <code>when { principal.id like "arn:aws:sts::&lt;ACCOUNT_ID&gt;:assumed-role/ApiReviewDeveloper*" }</code>. It proves the permit is scoped to the developer role and not to every IAM caller. The account ID and the gateway id suffix are blurred.</figcaption></figure>
+<figure><img alt="AgentCore console page for the ApiReviewChecker code interpreter" src="images/cloud-agentcore-console-ci-blurred.png" /><figcaption>Figure 27. The code interpreter <code>ApiReviewChecker</code> in the console: the example <code>invoke_code_interpreter</code> snippet for the resource, the "Code interpreter sessions (6)" list, with the visible sessions shown as Terminated and created on November 14, 2026 between 15:13 and 15:51 (ET), and the observability panel for the selected window reading 1 started session, 1 invocation and 0% invocation error rate. The session count is consistent with the repeated validate runs while I was fixing the issues in the troubleshooting section, and every session was stopped. The account ID and the interpreter id suffix are blurred.</figcaption></figure>
+<h3>What is tested, what is not (AgentCore)</h3>
+<ul>
+<li><strong>Observed live:</strong> gateway, target, policy engine and three ACTIVE permits created; the developer read allowed; <code>approve</code> denied by policy; the reviewer identity denied; the Code Interpreter flagged both breaks in the broken spec; console views of each resource.</li>
+<li><strong>Tested locally:</strong> the helper logic in <code>agentcore_setup.py</code> (13 tests): name patterns, trust shape, MCP protocol negotiation, Cedar statement generation and matching, checker-stream parsing, tool/route mapping and denial classification.</li>
+<li><strong>Not shown:</strong> an AgentCore Runtime, a workflow run that uses <code>SPEC_CHECK_MODE=agentcore</code>, and the Code Interpreter's observability beyond the one console view above.</li>
+</ul>
+<hr />
+<h2>10. A console tour of the deployed stack</h2>
+<p>Everything in this section was captured from the AWS console in <code>us-east-1</code> on November 14, 2026, between about 4:32 PM and 5:04 PM ET, after the stack had been deployed and used for the runs above. The account menu, account IDs inside URLs and ARNs, API ids and random resource suffixes are blurred. Each view maps to something the CloudShell walkthrough already created, so this is the same stack seen from the other side.</p>
+<h3>Step Functions: one named execution per job</h3>
+<figure><img alt="Step Functions console page for the api-review state machine with its executions list" src="images/cloud-sfn-executions-blurred.png" /><figcaption>Figure 28. The Step Functions console page for the state machine <code>api-review</code>: type Standard, status Active, created November 14, 2026 at 10:42:59 (UTC-05:00, which is ET), and X-Ray tracing Enabled. The Executions tab lists five executions named <code>review-job_&lt;jobId&gt;</code>, all Succeeded, from <code>review-job_d91438ad6d97f70467bd</code> (11:16 AM ET, 20.6 seconds) to <code>review-job_79fc043cf2b109f42aea</code> (2:51 PM ET, 22.2 seconds). The corrected job's execution, <code>review-job_834a7b9a23c87ce25a83</code>, ran for 4 minutes 46 seconds because it waited for the review, and "Succeeded" for a broken job only means the workflow reached its <code>MarkBlocked</code> end state, not that the candidate passed. This list was captured at 4:32 PM ET, so it does not include the later tracing test jobs. The ARNs and the browser address are blurred.</figcaption></figure>
+<figure><img alt="Step Functions execution detail page with the graph view for review-job_79fc043cf2b109f42aea" src="images/cloud-sfn-graph-blurred.png" /><figcaption>Figure 29. The detail page for <code>review-job_79fc043cf2b109f42aea</code>, the broken candidate that ran with the Bedrock advisory enabled: status Succeeded, type Standard, started 14:51:47.510 and ended 14:52:09.726 (UTC-05:00), duration 00:00:22.216, 10 state transitions. The graph view under the details draws the state machine with the states that ran in green; the page is cut off at the fold, so the individual states are not readable in this capture. It shows that every job gets its own named execution that you can open and replay state by state. The execution ARN, the role ARN and the browser address are blurred.</figcaption></figure>
+<h3>DynamoDB: the job, idempotency and outbox records</h3>
+<figure><img alt="DynamoDB Explore items view of the api-review-jobs table after a scan that returned 15 items" src="images/cloud-ddb-items-blurred.png" /><figcaption>Figure 30. The DynamoDB console's Explore items view for the table <code>api-review-jobs</code>: a scan that completed with 15 items returned and 15 scanned. The visible partition keys are of three kinds, <code>JOB#job_…</code>, <code>IDEM#…</code> and <code>OUTBOX#evt_…</code>, with the statuses BLOCKED, IDEMPOTENCY, DISPATCHED and APPROVED, which is the single-table layout from Step 7 in the real table. The <code>reviewNonce</code> value, the idempotency keys (they embed the caller's ARN), the name of an unrelated table in the same account and the account menu are blurred.</figcaption></figure>
+<figure><img alt="DynamoDB item JSON view for JOB#job_79fc043cf2b109f42aea showing the stored advisory block" src="images/cloud-ddb-item-blurred.png" /><figcaption>Figure 31. The item <code>JOB#job_79fc043cf2b109f42aea</code> opened in JSON view. The visible part of its <code>document</code> attribute is the advisory block: <code>authoritative: false</code>, a <code>deterministicHash</code>, explanations for the removed <code>next_cursor</code> and the <code>amount</code> type change, <code>modelId</code> <code>us.anthropic.claude-haiku-4-5-20251001-v1:0</code>, <code>modelStatus: parsed</code>, <code>includedInVerdict: false</code> and a <code>modelAdvisoryHash</code>; the rest of the document scrolls out of view. This is the same advisory shown in the report earlier (Figure 20), read straight from the table, and it confirms the model text is stored beside the evidence and flagged as non-authoritative. The account menu is blurred.</figcaption></figure>
+<h3>Amazon S3: the artifact bucket</h3>
+<figure><img alt="S3 console Properties tab for the artifact bucket showing Unknown Error panels" src="images/cloud-s3-properties-blurred.png" /><figcaption>Figure 32. The S3 console, Properties tab of the artifact bucket. The bucket overview shows the region US East (N. Virginia) us-east-1 and the creation date November 14, 2026, 10:42:00 (UTC-05:00), but the Bucket Versioning, Bucket ABAC, Tags and Default encryption panels all show "Unknown Error", under a "Networking error" banner. So this capture does <strong>not</strong> show the versioning or encryption settings; those come from the template, which declares versioning Enabled, AES256 default encryption and all four public-access blocks. The bucket name, ARN and browser address are blurred.</figcaption></figure>
+<p>The console's Objects tab for the same bucket returned the same "Unknown Error". I noted that the bucket has no bucket policy and did not establish whether that is related, so I read the bucket from CloudShell instead. The commands are not visible in the two captures below; they are <code>aws s3 ls</code> listings of this form:</p>
+<pre><code class="language-bash">aws s3 ls &quot;s3://&lt;ArtifactBucketName&gt;/&quot;
+aws s3 ls &quot;s3://&lt;ArtifactBucketName&gt;/&quot; --recursive
+</code></pre>
+<figure><img alt="CloudShell listing of the artifact bucket root showing a single prefix, artifacts/" src="images/cloud-s3-report-blurred.png" /><figcaption>Figure 33. CloudShell at 5:04 PM ET: the root of the artifact bucket contains one prefix, <code>PRE artifacts/</code>. Nothing else is stored at the top level, which matches the code, which writes each object under the key <code>artifacts/&lt;digest&gt;.json</code>. The account menu and the second browser tab's bucket name are blurred.</figcaption></figure>
+<figure><img alt="CloudShell recursive listing of four JSON objects under artifacts/" src="images/cloud-s3-objects-blurred.png" /><figcaption>Figure 34. The recursive listing under <code>artifacts/</code>: four JSON objects with 64-character hexadecimal names of 291, 814, 752 and 843 bytes. <code>aws s3 ls</code> prints UTC, so three objects were last written at 21:57:09 UTC (4:57 PM ET) and one at 16:32:52 UTC (11:32 AM ET). Only four objects after many jobs is consistent with the content-addressed keys (identical bytes are written under the same key); I did not list object versions here. The account menu and the bucket name in the browser tab are blurred.</figcaption></figure>
+<h3>SQS and EventBridge: the buffer and the bus</h3>
+<figure><img alt="SQS console filtered on api-review showing three standard queues" src="images/cloud-sqs-queues-blurred.png" /><figcaption>Figure 35. The Amazon SQS console filtered on <code>api-review</code>: three Standard queues, <code>api-review-eventbridge-dlq</code>, <code>api-review-work</code> and <code>api-review-worker-dlq</code>, all created 2026-11-14T10:41 (-05:00) and encrypted with SSE-SQS. Every queue shows 0 messages available and 0 in flight at 4:35 PM ET, so the two separate dead-letter queues from Section 4 were empty after all of the jobs above. The account menu is blurred.</figcaption></figure>
+<figure><img alt="EventBridge console page for the api-review event bus with its single rule" src="images/cloud-eventbridge-rules-blurred.png" /><figcaption>Figure 36. The EventBridge console page for the event bus <code>api-review</code> (the template's logical id for it is <code>ReviewBus</code>): created November 14, 2026 at 10:41 AM EST, schema discovery not initiated, and exactly one rule, <code>api-review-submitted</code>, type Standard and Enabled. That rule is the <code>JobSubmitted</code> pattern that routes events to the work queue. The event bus ARN, the rule ARN and the account menu are blurred.</figcaption></figure>
+<h3>Lambda and CloudWatch Logs: 15 functions, 16 log groups</h3>
+<figure><img alt="Lambda console function list filtered on api-review showing 15 functions" src="images/cloud-lambda-functions-blurred.png" /><figcaption>Figure 37. The Lambda console's function list filtered on <code>api-review</code>: 15 matches out of 23 functions in the account, all Zip packages on Python 3.12. The names are publisher, dispatcher, review-context, analyze, spec-check, expire, submit, harness, diff, validate, review, seal, register-wait, finalize and status, which is exactly the list in Section 4. All 15 show the same "46 minutes ago" modification age (the page says it was fetched at 4:42:07 PM EST), as you would expect after one stack update. The account menu is blurred.</figcaption></figure>
+<figure><img alt="CloudWatch Logs groups filtered on api-review showing 16 log groups with one month retention" src="images/cloud-cw-loggroups-blurred.png" /><figcaption>Figure 38. CloudWatch Logs, Log management, filtered on <code>api-review</code>: 16 matches, one <code>/aws/lambda/api-review-&lt;function&gt;</code> group for each of the 15 functions plus <code>/aws/states/api-review</code> for the state machine. All are Standard class with retention "1 month", which is the 30-day retention the template sets on each explicit log group. They exist because the template creates them, not because a first invocation did, and they are removed with the stack. The account has 39 log groups in total; the account menu is blurred.</figcaption></figure>
+<figure><img alt="A CloudWatch log stream of the api-review-status function showing INIT_START, START, END and REPORT lines" src="images/cloud-cw-logs-blurred.png" /><figcaption>Figure 39. One log stream of <code>/aws/lambda/api-review-status</code>, with the timezone set to UTC: an <code>INIT_START</code> line for the Python 3.12 runtime, then <code>START</code>, <code>END</code> and <code>REPORT</code> for one request at 2026-11-14T20:59 UTC (3:59 PM ET). The REPORT line shows Duration 1748.31 ms, Memory Size 256 MB, Max Memory Used 122 MB and Init Duration 1119.30 ms, and continues with an <code>XRAY</code> field that is cut off in this view. It shows the function logging to its own group and the cold-start initialization time of the OpenTelemetry-wrapped runtime. The account menu is blurred.</figcaption></figure>
+<hr />
+<h2>11. Amazon Q Developer: two design-review questions</h2>
+<p>Amazon Q Developer was never in the runtime path, and it did not write this repository's code: the code already existed when I asked these questions. On November 14, 2026 (about 4:44 to 4:46 PM ET) I used the Amazon Q Developer chat panel in the AWS console as a planning and design-review assist. I asked two general questions, with no repository attached, and compared its answers with what I had already built. The full, verbatim answers are saved in <code>results/q_developer_answers.md</code>; below I quote only short excerpts.</p>
+<h3>Question 1: detecting breaking changes between two OpenAPI specs</h3>
+<p>I asked: "What are best practices for detecting breaking changes between two OpenAPI specs, such as a removed response field or a field type changed from number to string?"</p>
+<figure><img alt="Amazon Q Developer chat panel in the console with the first question and the start of its answer" src="images/cloud-q-developer-1-blurred.png" /><figcaption>Figure 40. The Amazon Q Developer chat panel in the Lambda console, with the first question at the top and the start of the answer after "Retrieving knowledge". The answer opens with "What Counts as a Breaking Change", listing response breaks such as "Removing a required response field" and "Changing a field's type (e.g., number → string, object → array)", request breaks, and behavioral breaks. Those two response examples are exactly the two breaks in this guide's orders example. The account menu in the console header is blurred.</figcaption></figure>
+<figure><img alt="Amazon Q Developer chat panel showing contract testing, versioning and a recommended CI/CD pipeline pattern" src="images/cloud-q-developer-2-blurred.png" /><figcaption>Figure 41. Further down the same answer: "Contract Testing" (consumer-driven tests, with Pact named as an example), "Versioning as a Safety Net" citing the Well-Architected Framework item REL03-BP03, and a "Recommended CI/CD Pipeline Pattern on AWS" box that runs <code>oasdiff/openapi-diff</code> and fails on breaking changes before deploying. It closes with "treat your OpenAPI spec as a binding contract" and a list of sources. The account menu is blurred.</figcaption></figure>
+<p>What I took from it, using short quotes:</p>
+<ul>
+<li>It frames the control as a gate in the pipeline: "The most reliable approach is running a spec diff tool as a CI/CD gate that blocks merges when breaking changes are detected." That is the shape of this project, which implements its own diff (<code>src/apireview/diff.py</code>) and adds an old-client harness instead of adopting an off-the-shelf tool. I did not run oasdiff or Pact for this guide.</li>
+<li>It says API Gateway's own import check "only catches malformed specs — it does not detect semantic breaking changes like a removed field." That matches why the gate compares the old and the new document itself.</li>
+<li>Its "contract tests" suggestion resembles, in intent, the declarative client fixture and harness in Steps 2 and 4: a check that fails when a field is missing or has the wrong type.</li>
+</ul>
+<h3>Question 2: keeping an LLM advisory step from changing a verdict</h3>
+<p>I asked: "How should an AWS Step Functions workflow keep an LLM advisory step from changing a deterministic release verdict?"</p>
+<figure><img alt="Amazon Q Developer chat panel showing the second question, the core pattern and a Step Functions Task example" src="images/cloud-q-developer-3-blurred.png" /><figcaption>Figure 42. The second question and the start of its answer: "the LLM advises, the workflow decides", "The Core Pattern: Bounded Advisory Isolation" with a one-line flow (deterministic checks, LLM advisory step, deterministic verdict Lambda, Choice state, pass or fail), and the start of "Technique 1: Output Path Isolation", a Task state that writes to <code>ResultPath</code> <code>$.advisory</code>. The example uses a direct <code>bedrock:invokeModel</code> Task with the model id <code>amazon.nova-pro-v1:0</code>. The account menu is blurred.</figcaption></figure>
+<figure><img alt="Amazon Q Developer chat panel showing a deterministic verdict Lambda and a Choice state that reads only the verdict" src="images/cloud-q-developer-4-blurred.png" /><figcaption>Figure 43. The middle of the answer: a verdict handler that computes <code>approved</code> only from deterministic check results ("LLM output is never consulted for the verdict"), and "Technique 3: Choice State Reads Only the Deterministic Field", a Choice state that tests <code>$.verdict.approved</code>. The answer notes the Choice state is "structurally blind" to <code>$.advisory</code>. The account menu is blurred.</figcaption></figure>
+<figure><img alt="Amazon Q Developer chat panel showing the confidence gate, fabrication guard, audit trail and a summary of guardrails" src="images/cloud-q-developer-5-blurred.png" /><figcaption>Figure 44. The end of the answer: a confidence gate ("The LLM can only add friction (trigger human review) on an already-passing verdict — it can never override a failing one"), "Technique 5: Fabrication Guard in the Verdict Lambda", an audit-trail note about Step Functions execution history, and a "Summary of Guardrails" with five rows. The account menu is blurred.</figcaption></figure>
+<p>How this compares with what I built, stated carefully:</p>
+<ul>
+<li><strong>The principle matches.</strong> In this workflow the <code>Gate</code> Choice state tests <code>$.verdict</code> for the string <code>PASS</code>, and that value is produced by the <code>Seal</code> step from the deterministic findings and the harness result only. The advisory is stored with <code>authoritative: false</code> and <code>includedInVerdict: false</code> and is hashed separately.</li>
+<li><strong>The mechanism is different.</strong> Q's example isolates the model output with <code>ResultPath</code> on a direct <code>bedrock:invokeModel</code> Task. My state machine does not do that: every Task state returns <code>$</code>, and the model is called through Converse from the <code>analyze</code> Lambda. The isolation comes from the Lambda code and the verdict function, not from <code>ResultPath</code>. I did not change the workflow because of this answer.</li>
+<li><strong>One suggestion is not implemented.</strong> Q's confidence gate (low confidence leads to human approval) does not exist here; a human review step happens on every <code>PASS</code> regardless of any model output.</li>
+</ul>
+<p>Treat a Q answer as a prompt for a person to check against the code and the 72 tests, not as evidence. It does not replace the tests, and I did not use it as a code review.</p>
+<hr />
+<h2>12. Observability: logs, tracing, and what the X-Ray Trace Map did and did not show</h2>
+<h3>What each function is configured to do</h3>
+<p>Each Lambda in the stack has an explicit CloudWatch log group, <code>TracingConfig</code> <code>Active</code>, and the AWS OpenTelemetry layer. The API Gateway <code>live</code> stage and the Step Functions state machine have tracing turned on as well. The application code uses a small span helper (<code>tracing.py</code>) that records structured start and end events with the job id and optionally forwards to OpenTelemetry when it is installed. It never imports the maintenance-mode <code>aws-xray-sdk</code>, and a test (<code>test_repo_does_not_import_the_xray_sdk</code>) enforces that. The span helper strips <code>taskToken</code> and <code>reviewNonce</code> from attributes, and a test (<code>test_task_token_is_not_logged_or_returned</code>) checks the task token is not logged.</p>
+<figure><img alt="Lambda console Configuration tab for api-review-submit showing monitoring and operations tools" src="images/cloud-lambda-tracing-blurred.png" /><figcaption>Figure 45. The Lambda console for <code>api-review-submit</code>, Configuration tab, "Monitoring and operations tools". Logging configuration points at the log group <code>/aws/lambda/api-review-submit</code> with text log format, and under "Additional monitoring tools" the section "CloudWatch Application Signals and AWS X-Ray" shows "Lambda service traces" Enabled. The side panel on the left is the console's Amazon Q Developer chat panel, still showing the answer from Section 11. The account menu is blurred.</figcaption></figure>
+<h3>The first attempt: tracing was "on" and the Trace Map was empty</h3>
+<p>After the first deploy, every function had <code>TracingConfig</code> <code>Active</code>, the layer attached and these variables: <code>AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument</code>, <code>OTEL_PROPAGATORS=xray,tracecontext</code>, <code>OTEL_AWS_APPLICATION_SIGNALS_ENABLED=false</code> and an <code>OTEL_SERVICE_NAME</code> per function. I submitted a broken candidate (<code>job_d286cd77bde4a219e0f5</code>, idempotency key <code>cloud-broken-trace-0005</code>), which was <code>BLOCKED</code> as expected. In the X-Ray Trace Map the result was "No services", and there were 0 traces. I did not keep a screenshot of that first empty map; the Trace Map capture further down was taken after the fix and looks the same.</p>
+<p>The cause was in the environment. <code>OTEL_AWS_APPLICATION_SIGNALS_ENABLED=false</code> made the layer skip the AWS distro, so the spans went to the default exporter address, <code>localhost:4318</code>, and were dropped inside the function. The fix, in commit <code>37567ae</code>, sets the distro, the configurator and the exporter explicitly, and points the exporter at the X-Ray OTLP endpoint. This is the real block from <code>scripts/assemble_template.py</code>, with the repository's own comment:</p>
+<pre><code class="language-python"># The layer only selects aws_distro when Application Signals is true.
+# With it false, spans default to localhost:4318 and the Trace Map stays empty.
+# Export directly to the X-Ray OTLP endpoint, which Transaction Search stores in aws/spans.
+&quot;OTEL_AWS_APPLICATION_SIGNALS_ENABLED&quot;: &quot;false&quot;,
+&quot;OTEL_EXPORTER_OTLP_PROTOCOL&quot;: &quot;http/protobuf&quot;,
+&quot;OTEL_EXPORTER_OTLP_TRACES_ENDPOINT&quot;: {&quot;Fn::Sub&quot;: &quot;https://xray.${AWS::Region}.amazonaws.com/v1/traces&quot;},
+&quot;OTEL_LOGS_EXPORTER&quot;: &quot;none&quot;,
+&quot;OTEL_METRICS_EXPORTER&quot;: &quot;none&quot;,
+&quot;OTEL_PROPAGATORS&quot;: &quot;xray,tracecontext&quot;,
+&quot;OTEL_PYTHON_CONFIGURATOR&quot;: &quot;aws_configurator&quot;,
+&quot;OTEL_PYTHON_DISTRO&quot;: &quot;aws_distro&quot;,
+&quot;OTEL_SERVICE_NAME&quot;: {&quot;Fn::Sub&quot;: f&quot;${{ProjectName}}-{suffix}&quot;},
+&quot;OTEL_TRACES_EXPORTER&quot;: &quot;otlp&quot;,
+&quot;OTEL_TRACES_SAMPLER&quot;: &quot;parentbased_always_on&quot;,
+</code></pre>
+<p>The template test (<code>test_template_contracts</code>) now asserts these values, the <code>Active</code> tracing mode, tracing on the API stage and the state machine, and the two X-Ray write actions in the submit role.</p>
+<h3>After the fix: redeploy, a job, and a read-only check</h3>
+<p>I redeployed from <code>37567ae</code> (the log ended with <code>Successfully created/updated stack - api-review</code>) and submitted another broken candidate, <code>job_e02c5e57722dec400590</code> (key <code>cloud-broken-trace-0006</code>), which was <code>BLOCKED</code> again.</p>
+<figure><img alt="CloudShell output of submitting the tracing test job, with the BLOCKED verdict and the owner role" src="images/cloud-trace-job-blurred.png" /><figcaption>Figure 46. The submit output for the second tracing test job: <code>authoritativeVerdict</code> and <code>status</code> both <code>BLOCKED</code>, <code>mockVersion</code> <code>orders-v2-broken</code>, the job id <code>job_e02c5e57722dec400590</code>, an <code>evidenceHash</code>, and an owner of <code>…assumed-role/ApiReviewDeveloper/dev-ada</code>. The first line is a warning the script printed to stderr: "profile cannot read stack outputs; the lookup used ambient credentials". It is not a failure: the developer profile was denied access to the stack outputs, so <code>aws_demo.py</code> read the endpoint from the stack with CloudShell's own credentials and still signed the API call itself as the developer role. The account ID inside the ARNs, including the part that wrapped onto the next lines, and the account menu are blurred.</figcaption></figure>
+<p>To look at the configuration without changing anything, I wrote <code>scripts/check_tracing.sh</code>. It does not submit a job. It lists each function's tracing mode and the OpenTelemetry variables, reads the API stages and the state machine, asks X-Ray for trace summaries from the last 30 minutes, and prints the X-Ray indexing rules and the trace segment destination:</p>
+<pre><code class="language-bash">aws xray get-trace-summaries --region &quot;$REGION&quot; --start-time &quot;$START&quot; --end-time &quot;$END&quot; --output json
+aws xray get-indexing-rules --region &quot;$REGION&quot; --output json
+aws xray get-trace-segment-destination --region &quot;$REGION&quot; --output json
+</code></pre>
+<figure><img alt="CloudShell output of check_tracing.sh showing API stage tracing, Step Functions tracing, zero trace summaries, the indexing rule and the segment destination" src="images/cloud-check-tracing-blurred.png" /><figcaption>Figure 47. The tail of <code>scripts/check_tracing.sh</code> at 5:16 PM ET. The <code>live</code> stage reports <code>"tracing": true</code> for the review API (the API ids are blurred), Step Functions reports <code>"name": "api-review"</code> with <code>"enabled": true</code>, and the X-Ray trace summaries over the last 30 minutes number 0. The indexing rules show a single rule named <code>Default</code> that is <code>Probabilistic</code> with <code>DesiredSamplingPercentage</code> 1.0, and the trace segment destination is <code>CloudWatchLogs</code> with status <code>ACTIVE</code>. The last line confirms "This check did not submit a job." The account menu and the second tab's bucket name are blurred.</figcaption></figure>
+<figure><img alt="CloudShell output of check_tracing.sh showing the TracingConfig and OpenTelemetry environment for the publisher and dispatcher functions" src="images/cloud-check-tracing-2-blurred.png" /><figcaption>Figure 48. The start of the same check, captured at 5:32 PM ET, for the <code>api-review-publisher</code> and <code>api-review-dispatcher</code> functions: <code>TracingConfig</code> mode <code>Active</code>, <code>AWS_LAMBDA_EXEC_WRAPPER</code> <code>/opt/otel-instrument</code>, <code>OTEL_PYTHON_DISTRO</code> <code>aws_distro</code>, <code>OTEL_PYTHON_CONFIGURATOR</code> <code>aws_configurator</code>, <code>OTEL_TRACES_EXPORTER</code> <code>otlp</code>, the traces endpoint <code>https://xray.us-east-1.amazonaws.com/v1/traces</code>, and <code>OTEL_SERVICE_NAME</code> per function. The check printed the same block for every function; the capture shows these two, and I did not capture the rest of the list. The account menu is blurred.</figcaption></figure>
+<h3>What CloudWatch Transaction Search showed</h3>
+<figure><img alt="CloudWatch Transaction Search spans query reporting 207 spans" src="images/cloud-xray-spans-blurred.png" /><figcaption>Figure 49. CloudWatch Transaction Search, Spans tab, with the timezone set to UTC and a one-hour window. The query (<code>filterIndex @data_format = 'AWS-OTEL-TRACE-V1'</code>, sorted by timestamp) completed against one log group and returned 207 spans (207 records, 242.5 kB, scanned in 0.8 seconds). The histogram has a small cluster at about 21:57 UTC (4:57 PM ET) and a larger one at about 22:12 to 22:13 UTC (5:12 to 5:13 PM ET); the visible rows are spans such as <code>api-review-submit/LambdaService</code>, <code>DynamoDB.GetItem</code> and <code>S3.PutObject</code>. The commit for the tracing fix was made at 5:09 PM ET, and I did not capture which job each span belongs to. The side panel is the Amazon Q Developer chat panel from Section 11, and the account menu is blurred.</figcaption></figure>
+<figure><img alt="CloudWatch Transaction Search trace details for api-review POST /jobs with a 17-span timeline" src="images/cloud-xray-trace-blurred.png" /><figcaption>Figure 50. The trace details page for "api-review : POST /jobs": duration 3.6 s, response code 201, 17 spans, 0 faults, 0 errors and 0 throttles. The service graph runs client, the API Gateway stage, the Lambda context for <code>api-review-submit</code>, the function, and on to DynamoDB, and the timeline lists <code>POST /jobs</code> (3.6 s), <code>awslambda.Invoke</code>, the handler span <code>apireview.handlers.lambda_handlers.submit_handler</code> (2.0 s), <code>DynamoDB.GetItem</code> (142 ms), three <code>S3.PutObject</code> calls (149 ms, 36 ms and 28 ms) and <code>DynamoDB.TransactWriteItems</code> (22 ms), then the Lambda execution environment with its init span. The leading hexadecimal digits of this trace's id are its start time in epoch seconds (<code>6af8dcb6</code>, which decodes to 22:12:06 UTC, 5:12 PM ET); that is derived from the id, not shown by the console, and it falls after the tracing commit. It shows an end-to-end request across API Gateway, Lambda, DynamoDB and S3 with no errors. The account menu is blurred.</figcaption></figure>
+<h3>What it did not show</h3>
+<figure><img alt="X-Ray Trace Map for the last 15 minutes showing No services" src="images/cloud-xray-tracemap-blurred.png" /><figcaption>Figure 51. The CloudWatch Trace Map with a 15-minute window, captured at 5:19 PM ET (after the fix): "No services", "Try adjusting the time range", and "No node selected". This is the same view that was empty before the fix, so for the Trace Map the change made no visible difference in this capture. The side panel is the Amazon Q Developer chat panel from Section 11, and the account menu and a browser tab title are blurred.</figcaption></figure>
+<figure><img alt="CloudWatch log groups filtered on /aws/spans with no matches" src="images/cloud-aws-spans-loggroup-blurred.png" /><figcaption>Figure 52. CloudWatch Log groups (39 in total) filtered on <code>/aws/spans</code>: "0 matches" and "No log groups matched your filter". The filter was for <code>/aws/spans</code>, the name the repository's template comment gives for where Transaction Search stores spans, and it found nothing, while the spans in the previous figures were queryable in Transaction Search. I did not investigate further, so I make no claim about where those spans are stored or why the group is not listed. The side panel is the Amazon Q Developer chat panel from Section 11, and the account menu is blurred.</figcaption></figure>
+<p>Putting the observations together, without claiming more than I saw:</p>
+<ul>
+<li>Tracing configuration is correct and complete on every layer I checked: the functions, the API stage and the state machine.</li>
+<li>Spans from these functions are visible in CloudWatch Transaction Search (207 in the one-hour window), including a 17-span <code>POST /jobs</code> trace with no faults or errors.</li>
+<li>X-Ray trace summaries over the last 30 minutes were 0 and the Trace Map stayed on "No services".</li>
+<li>My reading, as an observation and not a guarantee: the trace segment destination is <code>CloudWatchLogs</code> (ACTIVE), so spans are stored in Transaction Search, and the indexing rule is <code>Default</code> probabilistic at 1.0%, so only about 1% of traces are indexed into X-Ray trace summaries and Trace Map entries. That would explain an empty map for a handful of test requests, but I did not test it (for example by raising the sampling percentage), so treat it as the explanation I find most likely, not as a verified one.</li>
+<li>The first-attempt failure (spans exported to <code>localhost:4318</code>) is a separate problem, and the commit fixed it. In my captures I did not isolate that fix from the Transaction Search setup: there are also spans at 21:57 UTC, before the commit, in the same table, and I did not investigate why.</li>
+<li>The two AgentCore console views (Figures 24 and 27) both show tracing as "Not enabled" for the gateway and the interpreter.</li>
+</ul>
+<hr />
+<h2>13. What was tested live, locally, and only proposed</h2>
+<p><strong>Observed live in AWS (us-east-1, November 14, 2026):</strong></p>
+<ul>
+<li>The CloudFormation stack <code>api-review</code>, including the first failed attempt and the working deploys; redeploys with the Bedrock advisory enabled, and the redeploy from <code>37567ae</code> for tracing.</li>
+<li>The broken candidate <code>BLOCKED</code> with one informational and two breaking findings; the corrected candidate <code>PASS</code>, <code>WAITING_REVIEW</code>, then <code>APPROVED</code>; two more broken candidates for the tracing check, both <code>BLOCKED</code>.</li>
+<li>A replayed approval rejected; a blocked job's review-context and review both rejected; the developer role denied the reviewer route by an explicit IAM deny.</li>
+<li>Two Bedrock comparison runs over five models each, including the Legacy and payment-instrument refusals; the live advisory on a real job from Claude Haiku 4.5.</li>
+<li>AgentCore Gateway, Policy (three Cedar permits) and Code Interpreter, with the allow, policy-deny, other-identity and interpreter checks, and four console views.</li>
+<li>The 72-test suite passing in CloudShell at <code>9e702c8</code>.</li>
+<li>The deployed services in the console: Step Functions executions, DynamoDB items, the S3 bucket through the CLI, SQS queues, the EventBridge bus and rule, Lambda functions and CloudWatch log groups (Section 10).</li>
+<li>Tracing configuration on every layer, spans and a 17-span trace in CloudWatch Transaction Search, and a Trace Map that stayed empty (Section 12).</li>
+<li>Two design questions answered by Amazon Q Developer in the console (Section 11), used as a planning assist only.</li>
+</ul>
+<p><strong>Tested locally only (72 tests, no AWS calls):</strong> the diff direction rules, the harness, sealing, idempotency conflicts, duplicate-event and crash/reconcile handling, DLQ separation, the policy mirror, DynamoDB Decimal handling, advisory parsing and report shaping, runtime-client wiring, the AgentCore helper logic, the template contract (including the tracing variables) and the cleanup helpers (batching, pagination, a missing bucket and the report format).</p>
+<p><strong>Proposed or not demonstrated:</strong></p>
+<ul>
+<li>An AgentCore Runtime hosting an advisory agent that calls the gateway.</li>
+<li>The workflow running with <code>SPEC_CHECK_MODE=agentcore</code> (Code Interpreter inside the state machine). The live workflow uses <code>SPEC_CHECK_MODE=in-process</code>.</li>
+<li>An X-Ray Trace Map that lists the services. It showed "No services" in every capture; the spans are visible only in Transaction Search, and I did not test the sampling explanation.</li>
+<li>The S3 console's view of versioning and default encryption (the panels returned "Unknown Error"). The template declares both, and I did not confirm them in the console.</li>
+<li>Amazon Q Developer on this repository's code. The two answers were general design guidance.</li>
+<li>The cleanup run (Section 15), including the new version-aware bucket emptying and the final existence check. Both are covered by unit tests only.</li>
+</ul>
+<hr />
+<h2>14. Troubleshooting: the real fix chain</h2>
+<p>Every item below is something that actually went wrong in this build. Where I have the exact message from a run, I quote it. Where the only evidence is the code and the commit that fixed it, I describe the behavior the code now handles and do not invent an error string. Commit ids are in the public repository.</p>
+<h3>Deploying the core stack</h3>
+<ul>
+<li><strong>Template too large for a direct deploy</strong> (<code>955fb9e</code>). <em>Symptom:</em> "Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket" (Figure 4). <em>Fix:</em> upload through the code bucket with <code>--s3-bucket</code> and <code>--s3-prefix</code>, which the script now does. The generated template is 94,421 bytes.</li>
+<li><strong><code>Payload.$$</code> rejected</strong> (<code>4019058</code>). <em>Cause:</em> the state machine definition is passed through <code>Fn::Sub</code>, which treats <code>$</code> specially, so the <code>$$.Task.Token</code> context reference did not survive. <em>Fix:</em> <code>scripts/assemble_template.py</code> doubles the <code>$</code> characters when it embeds the definition, so always regenerate the template with that script instead of pasting the JSON. The failed create left the stack in <code>ROLLBACK_COMPLETE</code>; that stack had to be deleted before I could redeploy.</li>
+<li><strong>HTTP 500 "AWS clients are not configured"</strong> (<code>c484c18</code>). <em>Cause:</em> the handlers fail closed when no AWS clients are injected, and the Lambda runtime had none wired. <em>Fix:</em> <code>runtime_clients.py</code> builds and caches the SDK clients only inside the Lambda runtime, only when needed, and never at import time.</li>
+<li><strong>Redeploys did not update the code</strong> (<code>d17ae91</code>). <em>Cause:</em> the zip was uploaded under one static S3 key, so CloudFormation saw no change. <em>Fix:</em> a content-addressed key, <code>api-review/lambda-&lt;first 16 hex of the zip's sha256&gt;.zip</code>.</li>
+<li><strong><code>authorization_failed</code>: "unsupported caller ARN shape"</strong> (<code>711708d</code>). <em>Cause:</em> I was calling as the CloudShell root user, and the handlers accept only the developer and reviewer roles. <em>Fix:</em> the scripted operator user and the two roles, and the three CLI profiles (Step 9).</li>
+<li><strong><code>CreateRole</code> failed with <code>MalformedPolicyDocument</code>: "Invalid principal"</strong> (<code>df151ea</code>). <em>Cause:</em> IAM eventual consistency: the role's trust policy named a user created seconds earlier. <em>Fix:</em> <code>setup_demo_identities.sh</code> retries up to 8 times with a 10-second wait on exactly that error.</li>
+<li><strong>Report returned HTTP 500: <code>Decimal</code> is not JSON serializable</strong> (<code>afa8fdd</code>). <em>Cause:</em> DynamoDB returns numbers as <code>Decimal</code>, and the evidence contains money-style values. <em>Fix:</em> convert to native numbers on read, and a test (<code>test_report_serializes_decimal_evidence_and_hash_matches</code>) proves the evidence hash still matches after the conversion.</li>
+</ul>
+<h3>The Bedrock advisory and the comparison</h3>
+<ul>
+<li><strong>Models refused as Legacy</strong> (Sonnet 4.5, Llama 3.3 70B, then Llama 4 Maverick). <em>Symptom:</em> <code>ResourceNotFoundException: Access denied. This Model is marked by provider as Legacy and you have not been actively using the model in the last 30 days.</code> <em>Fix:</em> none in code; replace the model, and let the comparison script record the refusal per model.</li>
+<li><strong>Sonnet 4.6 refused for a payment instrument.</strong> <em>Symptom:</em> "Model access is denied due to INVALID_PAYMENT_INSTRUMENT: A valid payment instrument must be provided.. Your AWS Marketplace subscription for this model cannot be completed at this time." <em>Fix:</em> an account-level setup issue for that model, not something the code can resolve; I left it as a recorded result.</li>
+<li><strong>Strict parser rejected valid model output</strong> (<code>de60ed5</code>). <em>Symptom:</em> run 1 parse results 0/3, 2/3 and 0/3 for Haiku, Pixtral and Nova; the live job's advisory said "model explanations or proposals were not arrays". <em>Cause:</em> the original parser accepted only a bare, exactly shaped JSON object, while a model can wrap it in a code fence or add prose. <em>Fix:</em> the parser changes described in Section 8.</li>
+<li><strong>The report dropped the model text</strong> (<code>f0e6102</code>). <em>Symptom:</em> <code>modelStatus: parsed</code> but no explanations on the report (Figure 19). <em>Cause:</em> the report builder copied only <code>source</code>, <code>modelStatus</code> and <code>error</code>. <em>Fix:</em> <code>report_advisory</code> now returns the parsed explanations and proposals, with source <code>bedrock-converse</code>.</li>
+<li><strong>Mistyped job ids.</strong> <em>Symptom:</em> <code>not_found</code> on <code>status</code> and <code>report</code> for a job that existed (the real id was <code>job_63b4574b6378286872e1</code>; I typed <code>job_63b5474b…</code>). <em>Fix:</em> never type a job id. <code>aws_demo.py submit</code> saves the id to <code>~/.api-review-last-job</code>, and every later command takes <code>--job-id last</code>. When you do need an id, take it from the output of a command, not from memory.</li>
+</ul>
+<h3>CloudShell typing problems</h3>
+<ul>
+<li><em>Symptom:</em> the CloudShell terminal sometimes dropped or swapped characters in long commands and occasionally froze, so a command that looked right on screen was not what ran. <em>What worked:</em> reload the tab (F5) or reopen <code>https://us-east-1.console.aws.amazon.com/cloudshell/home?region=us-east-1</code>; your home directory, including <code>~/api-review</code>, persists. Prefix commands with <code>clear;</code> so you can read exactly what was typed, then check the line before pressing Enter. Do not hand-type ids: use <code>--job-id last</code> or a shell variable. Use short wrapper variables for long values, and check a deploy by grepping the log, <code>grep 'Successfully created/updated stack' ~/deployN.log</code>, rather than reading the scrollback. The repository's CloudShell checkout is <code>~/api-review</code>.</li>
+</ul>
+<h3>The AgentCore chain, in the order it happened</h3>
+<ol>
+<li><strong>Roles by hand</strong> (<code>39b1f6e</code>). The first version assumed two role ARNs were supplied. <em>Fix:</em> <code>enable</code> creates <code>ApiReviewCodeInterpreter</code> and <code>ApiReviewGateway</code> itself when they are not provided, and a <code>validate</code> command and teardown were added.</li>
+<li><strong>Resource names that violate each API's name pattern</strong> (<code>82d1a52</code>). The first names were hyphenated (<code>api-review-checker</code>, <code>api-review-tools</code>), which does not match the Code Interpreter pattern <code>[a-zA-Z][a-zA-Z0-9_]{0,47}</code>. <em>Fix:</em> <code>ApiReviewChecker</code>, <code>ApiReviewTools</code>, <code>ApiReviewPolicy</code>, <code>ReviewTools</code> and the three <code>Allow…</code> policy names, with a test (<code>test_resource_names_match_documented_patterns</code>) that matches each against the documented regex. The gateway and target names are the two that may contain hyphens; the policy engine, the policies and the Code Interpreter may not.</li>
+<li><strong>MCP protocol version</strong> (<code>2d80018</code>). The validation client sent the header <code>MCP-Protocol-Version: 2025-11-25</code>, but the gateway I created advertises only the older <code>2025-03-26</code> (the code comment says gateways created before the later protocol versions advertise only that one). The unit-test fixture for this case is a JSON-RPC error reading <code>Unsupported protocol version: 2025-11-25</code> with <code>supported: ["2025-03-26"]</code>. <em>Fix:</em> the client reads the gateway's supported versions, prefers <code>2025-03-26</code>, and renegotiates from the server's error (<code>negotiated_protocol</code>).</li>
+<li><strong>Code Interpreter trust</strong> (<code>2d80018</code>). A trust policy tied to one specific interpreter id does not match when the session starts. <em>Fix:</em> <code>aws:SourceArn</code> is <code>arn:aws:bedrock-agentcore:&lt;region&gt;:&lt;ACCOUNT_ID&gt;:*</code> with <code>aws:SourceAccount</code> set, which is the documented form. The code also retries session start while the role is "not assumable yet".</li>
+<li><strong>Gateway trust</strong> (<code>fe96ad7</code>). <code>CreateGateway</code> assumes the gateway role while validating the policy engine, and the source of that call is the <em>policy engine</em>, not the gateway, so a gateway-only <code>aws:SourceArn</code> is rejected. <em>Fix:</em> the same account-wide <code>…:*</code> source ARN for the gateway role (<code>test_gateway_trust_stays_account_wide</code>).</li>
+<li><strong>Gateway reuse</strong> (<code>fe96ad7</code>). A re-run of enable did not reuse the gateway that already existed. <em>Fix:</em> list gateways (the response key is <code>items</code>; the gateway's id is the lowercased name plus a suffix), reuse the match, and attach the policy engine if it is missing.</li>
+<li><strong>Checker stream parse</strong> (<code>fe96ad7</code>). The Code Interpreter returns an event stream, and the checker's result object contains nested objects, so taking the last <code>{</code> read the inside of <code>findings</code>. <em>Fix:</em> collect the text from the stream events, parse the first balanced top-level object, and require <code>ok: false</code> with both expected rule ids (<code>test_checker_output_parses_the_first_object_and_expected_findings</code>).</li>
+<li><strong>Cedar principal</strong> (<code>38eb412</code>). The first permits used an unconstrained <code>principal</code>. <em>Fix:</em> <code>principal is AgentCore::IamEntity</code>, so the permit matches the IAM caller type. Enable also refreshes stored policies that differ from the desired statement.</li>
+<li><strong>FAILED policies were never replaced</strong> (<code>9aacb84</code>). A policy that failed validation stayed in the engine under the same name, so a re-run kept a permit that permitted nothing. <em>Fix:</em> enable deletes any policy that is not already the desired statement in <code>ACTIVE</code>, waits until the name is gone, and creates all three again with <code>FAIL_ON_ANY_FINDINGS</code>; the action ids are built from the target's real tool names, and <code>statusReasons</code> is printed as the validation report.</li>
+<li><strong>The "overly permissive" finding</strong> (<code>5d5df23</code>). With <code>principal is AgentCore::IamEntity</code> alone, Cedar validation flagged each permit as overly permissive (any IAM caller). <em>Fix:</em> the <code>when { principal.id like "arn:aws:sts::&lt;ACCOUNT_ID&gt;:assumed-role/ApiReviewDeveloper*" }</code> clause you can see in Figure 26. That is also what makes the reviewer identity fail the <code>other-identity</code> check.</li>
+<li><strong>Gateway 403 and swapped tool routes</strong> (<code>fc35e03</code>). Two issues together. The gateway signs its call to the review API as <code>ApiReviewGateway</code>, not as the developer session, and the status Lambda answered 403 because the caller was not the job's owner; the gateway surfaced that as an internal error. Separately, the tool-to-route mapping had the read tools on the wrong routes. <em>Fix:</em> <code>caller_may_read_job</code> lets the gateway role read a job owned by <code>ApiReviewDeveloper</code> (any other caller must be the owner), the status Lambda was redeployed, and the mapping is now <code>read_artifacts</code> → <code>GET /jobs/{jobId}</code>, <code>read_test_results</code> → <code>GET /jobs/{jobId}/report</code>, <code>request_spec_check</code> → <code>POST /jobs</code> (<code>test_tool_routes_match_the_operation_names</code>). Validate now also prints the job id it used and the last five minutes of the relevant Lambda and gateway logs when a read fails.</li>
+</ol>
+<p>After these, the validation in Step 15 passed on commit <code>fc35e03</code>.</p>
+<h3>Tracing, console and cleanup</h3>
+<ul>
+<li><strong>Tracing "on" but the Trace Map empty</strong> (<code>37567ae</code>). <em>Symptom:</em> after a <code>BLOCKED</code> job (<code>job_d286cd77bde4a219e0f5</code>, key <code>cloud-broken-trace-0005</code>) the X-Ray Trace Map showed "No services" and there were 0 traces, although every function had <code>TracingConfig</code> <code>Active</code>. <em>Cause:</em> <code>OTEL_AWS_APPLICATION_SIGNALS_ENABLED=false</code> made the layer skip the AWS distro, so spans went to <code>localhost:4318</code> and were dropped. <em>Fix:</em> each function now sets <code>OTEL_PYTHON_DISTRO=aws_distro</code>, <code>OTEL_PYTHON_CONFIGURATOR=aws_configurator</code>, <code>OTEL_TRACES_EXPORTER=otlp</code> and <code>OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://xray.us-east-1.amazonaws.com/v1/traces</code>; I redeployed (<code>Successfully created/updated stack - api-review</code>) and added <code>scripts/check_tracing.sh</code> to read the configuration back. <em>Still open:</em> the Trace Map stayed on "No services" afterwards, while Transaction Search showed spans (Section 12).</li>
+<li><strong>"profile cannot read stack outputs; the lookup used ambient credentials"</strong> (a warning, not an error). The developer profile is denied access to the stack outputs, so <code>aws_demo.py</code> reads the endpoint from the stack with CloudShell's own credentials and prints this warning to stderr. The API call itself is still signed as the developer role, which the job's <code>owner</code> shows (Figure 46).</li>
+<li><strong>S3 console "Unknown Error"</strong> on the Objects and Properties tabs (Figure 32). I did not establish the cause (I noted only that the bucket has no bucket policy). <em>What worked:</em> <code>aws s3 ls</code> from CloudShell (Figures 33 and 34).</li>
+<li><strong>Cleanup could be blocked by object versions</strong> (<code>9e702c8</code>). This was a risk I found by reading the script, not a failure I hit in AWS. <em>Cause:</em> the artifact bucket is versioned, and <code>aws s3 rm --recursive</code> leaves older versions and delete markers behind, which stops CloudFormation from deleting the bucket. <em>Fix:</em> <code>scripts/empty_bucket_versions.py</code> deletes every version and delete marker before the stack is deleted, and <code>scripts/verify_cleanup.py</code> prints a final existence check (Section 15).</li>
+</ul>
+<hr />
+<h2>15. Cleanup (commands documented; run at the end)</h2>
+<p><strong>Status: I have not run the cleanup.</strong> The stack and the AgentCore resources described above still exist in my account as I write this. These are the commands, what they do in order, and how to verify that everything is gone. Run them when you are done with the guide. Since commit <code>9e702c8</code> the script empties every object version and delete marker before it deletes the stack, and it ends with an existence check; both were added after I found the versioning risk by reading the script, and both are covered only by unit tests (no AWS calls), not by a live run.</p>
+<h3>The command</h3>
+<pre><code class="language-bash">cd ~/api-review &amp;&amp; CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/cleanup_cloudshell.sh
+</code></pre>
+<p>Without <code>CONFIRM_CLEANUP=yes</code> the script prints a refusal and exits with status 2 and deletes nothing. <code>REGION</code> is required.</p>
+<h3>What it removes, in order</h3>
+<ol>
+<li><strong>AgentCore</strong> (unless <code>CLEANUP_AGENTCORE=no</code>): runs <code>scripts/teardown_agentcore.sh</code>, which runs <code>agentcore_setup.py teardown</code>. That deletes the gateway targets and the gateway <code>ApiReviewTools</code>, then the policies and the policy engine <code>ApiReviewPolicy</code>, then the Code Interpreter <code>ApiReviewChecker</code>, then the roles <code>ApiReviewCodeInterpreter</code> and <code>ApiReviewGateway</code> (their inline policies first), and removes <code>build/agentcore-ids.json</code>. It looks resources up by those exact names (and the ids in the state file), so it does not touch other gateways, engines or interpreters.</li>
+<li><strong>Both buckets are emptied, versions included.</strong> <code>scripts/empty_bucket_versions.py</code> lists every object version and delete marker in the artifact bucket (its name is read from the stack output <code>ArtifactBucketName</code>) and in the code bucket (<code>api-review-code-&lt;ACCOUNT_ID&gt;-us-east-1</code>, or <code>$DEPLOY_BUCKET</code>), deletes them in batches of 1,000 and follows pagination. A bucket that does not exist deletes nothing. It prints <code>Removed N object versions and delete markers from &lt;bucket&gt;.</code> for each bucket.</li>
+<li><strong>The stack is deleted</strong> (<code>aws cloudformation delete-stack</code> for <code>api-review</code>, or <code>$STACK_NAME</code>) and the script waits for <code>stack-delete-complete</code>. That removes the REST APIs, Lambda functions and their log groups, the state machine, the queues, the EventBridge bus and rule, the DynamoDB table and the per-function IAM roles.</li>
+<li><strong>The code bucket is removed.</strong> If it still exists, the script empties it again and runs <code>aws s3 rb</code>.</li>
+<li><strong>IAM demo identities</strong> (unless <code>CLEANUP_IDENTITIES=no</code>): runs <code>scripts/teardown_demo_identities.sh</code>, which deletes the inline policies and then the roles <code>ApiReviewDeveloper</code> and <code>ApiReviewReviewer</code>, the access keys, inline policies and the IAM user <code>api-review-operator</code>, and strips the three profiles (<code>api-review-operator</code>, <code>api-review-developer</code>, <code>api-review-reviewer</code>) from <code>~/.aws/config</code> and <code>~/.aws/credentials</code>.</li>
+<li><strong>A final existence check:</strong> <code>scripts/verify_cleanup.py</code> prints one line per resource.</li>
+</ol>
+<p>The core of the emptying step is small. This is the real code, trimmed to the two functions that matter:</p>
+<pre><code class="language-python">def version_delete_batches(pages, batch_size=1000):
+    objects = []
+    for page in pages:
+        for key in (&quot;Versions&quot;, &quot;DeleteMarkers&quot;):
+            for item in page.get(key) or []:
+                objects.append({&quot;Key&quot;: item[&quot;Key&quot;], &quot;VersionId&quot;: item[&quot;VersionId&quot;]})
+    return [objects[start : start + batch_size] for start in range(0, len(objects), batch_size)]
+
+# purge_bucket(client, bucket) pages through list_object_versions (KeyMarker and
+# VersionIdMarker), calls delete_objects for each batch, and returns how many
+# versions and delete markers it removed. A missing bucket returns 0.
+</code></pre>
+<p>The existence check reports <code>exists</code>, <code>absent</code> or <code>unknown</code> for each of these: the stack <code>api-review</code>, the artifact bucket, the code bucket, the table <code>api-review-jobs</code>, the roles <code>ApiReviewDeveloper</code>, <code>ApiReviewReviewer</code>, <code>ApiReviewCodeInterpreter</code> and <code>ApiReviewGateway</code>, the user <code>api-review-operator</code>, the gateway <code>ApiReviewTools</code>, the policy engine <code>ApiReviewPolicy</code> and the code interpreter <code>ApiReviewChecker</code>. After a clean run every line should read <code>absent</code>. <code>unknown</code> means the lookup failed for a reason other than "not found" (for example, missing permissions), so check that resource in the console; the script does not guess. The four tests in <code>tests/test_cleanup_versions.py</code> cover the batching at 1,000, pagination and a missing bucket, the report format and the AgentCore example JSON names. None of them calls AWS.</p>
+<p>The two flags let you keep a layer:</p>
+<pre><code class="language-bash"># remove the stack but keep the AgentCore resources
+CONFIRM_CLEANUP=yes REGION=us-east-1 CLEANUP_AGENTCORE=no bash scripts/cleanup_cloudshell.sh
+# remove the stack but keep the operator user and caller roles
+CONFIRM_CLEANUP=yes REGION=us-east-1 CLEANUP_IDENTITIES=no bash scripts/cleanup_cloudshell.sh
+</code></pre>
+<p>You can also run each teardown on its own: <code>CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/teardown_agentcore.sh</code> and <code>CONFIRM_CLEANUP=yes bash scripts/teardown_demo_identities.sh</code>.</p>
+<p>One thing to know before you run it: if you keep the identities (<code>CLEANUP_IDENTITIES=no</code>), the inline <code>api-review-invoke-gateway</code> policy that <code>enable_agentcore.sh</code> put on <code>ApiReviewDeveloper</code> and <code>ApiReviewReviewer</code> stays on those roles, because only the identity teardown removes the roles' inline policies.</p>
+<h3>Verify that it is gone</h3>
+<p>The script's own existence check covers the stack, buckets, table, IAM entities and the three AgentCore resources. These commands cover what it does not check. Each should report that the resource does not exist or return nothing.</p>
+<pre><code class="language-bash">aws sqs list-queues --region us-east-1 --queue-name-prefix api-review                  # no queues
+aws stepfunctions list-state-machines --region us-east-1 --query &quot;stateMachines[?name=='api-review']&quot;   # []
+aws logs describe-log-groups --region us-east-1 --log-group-name-prefix /aws/lambda/api-review          # none
+aws logs describe-log-groups --region us-east-1 --log-group-name-prefix /aws/states/api-review          # none (state machine log group)
+aws events list-event-buses --region us-east-1 --name-prefix api-review                # no bus named api-review
+grep -c 'api-review' ~/.aws/config ~/.aws/credentials                                  # 0 matches for the profiles
+</code></pre>
+<p>If you want to double-check the main pieces by hand as well:</p>
+<pre><code class="language-bash">aws cloudformation describe-stacks --region us-east-1 --stack-name api-review          # &quot;does not exist&quot;
+aws s3api head-bucket --bucket &quot;api-review-code-&lt;ACCOUNT_ID&gt;-us-east-1&quot;                # 404 Not Found
+aws s3api head-bucket --bucket &quot;&lt;ArtifactBucketName&gt;&quot;                                  # 404 Not Found
+aws dynamodb describe-table --region us-east-1 --table-name api-review-jobs            # ResourceNotFoundException
+</code></pre>
+<h3>Manual console checks</h3>
+<ul>
+<li><strong>CloudFormation:</strong> the stack <code>api-review</code> is not listed (or shows <code>DELETE_COMPLETE</code> under Deleted stacks).</li>
+<li><strong>Amazon S3:</strong> no bucket whose name starts with <code>api-review-code-</code> or <code>api-review-artifactbucket</code>.</li>
+<li><strong>DynamoDB:</strong> no table <code>api-review-jobs</code>. <strong>SQS:</strong> no <code>api-review-work</code> or <code>api-review-…dlq</code> queues. <strong>EventBridge:</strong> no event bus named <code>api-review</code>. <strong>Step Functions:</strong> no state machine <code>api-review</code>. <strong>CloudWatch:</strong> no <code>/aws/lambda/api-review-*</code> or <code>/aws/states/api-review</code> log groups.</li>
+<li><strong>IAM:</strong> no roles <code>ApiReviewDeveloper</code>, <code>ApiReviewReviewer</code>, <code>ApiReviewGateway</code>, <code>ApiReviewCodeInterpreter</code>, and no user <code>api-review-operator</code>.</li>
+<li><strong>Amazon Bedrock AgentCore console:</strong> no gateway <code>ApiReviewTools</code> under Gateways, no <code>ApiReviewPolicy</code> under Policy, and no <code>ApiReviewChecker</code> under Code Interpreter. The AgentCore documentation describes a retention period for Code Interpreter session data, so I do not promise that every trace of past sessions disappears at once.</li>
+<li><strong>CloudShell home directory:</strong> you may also delete the local files <code>~/api-review-*.log</code>, <code>~/deploy*.log</code>, <code>~/review-context.json</code>, <code>~/broken-report.json</code>, <code>~/.api-review-last-job</code> and <code>~/api-review/build/</code>. They hold no credentials.</li>
+<li>Bedrock model access needs no cleanup: the advisory calls create no resources.</li>
+</ul>
+<hr />
+<h2>16. Conclusion</h2>
+<p>A breaking API change is a small diff and a large outage, and the failure mode is that the person approving it is shown the wrong evidence. This gate puts the decision where it belongs: a deterministic diff and a fixed old-client harness decide, and nothing probabilistic can overrule them. In AWS, with real roles, the broken orders candidate was <code>BLOCKED</code> with the exact two breaks (the removed required <code>next_cursor</code> and the <code>amount</code> number-to-string change), the corrected candidate passed and waited, a <em>different</em> identity approved the sealed evidence once, a replay and a blocked-job approval both failed closed, and the developer role was denied the reviewer route by IAM itself.</p>
+<p>Bedrock adds something genuinely useful on top: plain-language explanations and proposed fixes on the report, from a model of your choice, clearly labeled as advisory, hashed separately and excluded from the verdict. The comparison runs also showed something I would not have guessed from the documentation: a good share of the models I tried were simply unavailable to my account, for lifecycle or account-setup reasons, so a comparison that records refusals is part of the design. AgentCore adds a tool boundary you can read: a Gateway that exposes three read tools, a Cedar policy that permits only the developer role to call them, an <code>approve</code> tool that exists only to be denied, and a Code Interpreter that runs a fixed checker and found the same two breaks.</p>
+<p>Two smaller lessons came from the console work. First, "tracing enabled" on a function does not mean spans arrive anywhere: the first attempt had every function on <code>Active</code> tracing and an empty Trace Map, because one environment variable made the layer export to <code>localhost:4318</code>. Second, even after the fix the Trace Map stayed on "No services" while CloudWatch Transaction Search showed the spans, so I would check the span view, not only the map, before concluding that tracing is broken. Amazon Q Developer played a small, honest role: I asked it two design questions, its principle ("the LLM advises, the workflow decides") matched what I had built, and its mechanism differed from mine.</p>
+<p>What I would still do before calling this production-ready is on the "proposed" list above: host the advisory agent in an AgentCore Runtime, run the workflow with the Code Interpreter inside it, understand why the Trace Map stays empty (the indexing rule samples 1% of traces, which I did not test), and run and verify the cleanup. I would rather publish that gap than paper over it.</p>
+<p>The code, the scripts and the 72 tests are in the repository: https://github.com/Ajayuppu/before-you-merge-api-release-gate.</p>
+<hr />
+<h2>Appendix A. Repository map</h2>
+<ul>
+<li><code>src/apireview/diff.py</code>: response and request compatibility rules</li>
+<li><code>src/apireview/harness.py</code>: fixed assertions and the mock URL allow-list</li>
+<li><code>src/apireview/evidence.py</code>: sealing and the verdict function</li>
+<li><code>src/apireview/advisory.py</code>: Converse request, parser, merge and report shaping</li>
+<li><code>src/apireview/agent_boundary.py</code>: local policy mirror of the three allowed tools</li>
+<li><code>src/apireview/checker.py</code>: the fixed spec checker (also run in Code Interpreter by <code>validate</code>)</li>
+<li><code>src/apireview/identity.py</code>: caller identity from the API Gateway request context</li>
+<li><code>src/apireview/handlers/lambda_handlers.py</code>: all 15 cloud handlers</li>
+<li><code>cloud/statemachine.asl.json</code> and <code>cloud/template.deploy.json</code>: workflow and generated CloudFormation</li>
+<li><code>cloud/agentcore/*.cedar</code> and <code>*.json</code>: reference Cedar and create requests, now using the live names (<code>ApiReviewChecker</code>, <code>ApiReviewTools</code>, <code>AllowReadArtifacts</code>). The Python script <code>scripts/agentcore_setup.py</code> remains the source of truth for names and statements</li>
+<li><code>scripts/deploy_cloudshell.sh</code>, <code>setup_demo_identities.sh</code>, <code>enable_agentcore.sh</code>, <code>validate_agentcore.sh</code>, <code>compare_bedrock_models.py</code>, <code>aws_demo.py</code>, <code>cleanup_cloudshell.sh</code>, <code>empty_bucket_versions.py</code>, <code>verify_cleanup.py</code>, <code>check_tracing.sh</code>, <code>teardown_agentcore.sh</code>, <code>teardown_demo_identities.sh</code></li>
+<li><code>fixtures/</code>: the three orders documents, the client fixture and three mock bodies</li>
+</ul>
+<h2>Appendix B. Commands in one place</h2>
+<pre><code class="language-bash"># 1. clone and test
+git clone https://github.com/Ajayuppu/before-you-merge-api-release-gate ~/api-review &amp;&amp; cd ~/api-review
+pip install pytest &amp;&amp; python3 -m pytest -q
+
+# 2. deploy (core stack)
+CONFIRM_DEPLOY=yes REGION=us-east-1 OTEL_LAYER_ARN='&lt;current regional ADOT Python layer ARN&gt;' bash scripts/deploy_cloudshell.sh
+
+# 3. caller identities
+CONFIRM_IDENTITIES=yes REGION=us-east-1 bash scripts/setup_demo_identities.sh
+
+# 4. broken, corrected, review (see Steps 10 to 13 for the full commands)
+python3 scripts/aws_demo.py --region us-east-1 --profile api-review-developer submit ... --idempotency-key &lt;new key&gt;
+python3 scripts/aws_demo.py --region us-east-1 --profile api-review-reviewer review-context --job-id last
+python3 scripts/aws_demo.py --region us-east-1 --profile api-review-reviewer review --job-id last --evidence-hash &quot;$EVIDENCE_HASH&quot; --nonce &quot;$NONCE&quot; --decision approve
+
+# 5. Bedrock advisory on, and model comparison
+CONFIRM_DEPLOY=yes REGION=us-east-1 OTEL_LAYER_ARN='&lt;arn&gt;' BEDROCK_ADVISORY=enabled BEDROCK_MODEL_ID='us.anthropic.claude-haiku-4-5-20251001-v1:0' bash scripts/deploy_cloudshell.sh
+PYTHONPATH=src python3 scripts/compare_bedrock_models.py --region us-east-1 --report ~/broken-report.json --runs 3 --print-raw
+
+# 6. AgentCore
+CONFIRM_AGENTCORE=yes REGION=us-east-1 bash scripts/enable_agentcore.sh
+CONFIRM_VALIDATE=yes  REGION=us-east-1 bash scripts/validate_agentcore.sh
+
+# 7. read-only tracing check (does not submit a job)
+REGION=us-east-1 bash scripts/check_tracing.sh
+
+# 8. cleanup (documented; run at the end)
+CONFIRM_CLEANUP=yes REGION=us-east-1 bash scripts/cleanup_cloudshell.sh
+</code></pre>
+</body>
+</html>
