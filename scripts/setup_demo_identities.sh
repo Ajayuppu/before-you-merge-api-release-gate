@@ -116,6 +116,7 @@ else
   aws iam create-user --user-name "$USER_NAME" >/dev/null
   echo "Created IAM user ${USER_NAME}."
 fi
+aws iam wait user-exists --user-name "$USER_NAME"
 aws iam put-user-policy --user-name "$USER_NAME" --policy-name assume-caller-roles --policy-document "file://${WORKDIR}/operator.json"
 
 KEY_COUNT="$(aws iam list-access-keys --user-name "$USER_NAME" --query 'length(AccessKeyMetadata)' --output text)"
@@ -144,15 +145,43 @@ else
   echo "Left the existing ${USER_NAME} access key in place."
 fi
 
+retry_trust_principal() {
+  local description="$1"
+  shift
+  local attempt=1
+  local errfile status err
+  errfile="$(mktemp)"
+  while [[ "$attempt" -le 8 ]]; do
+    status=0
+    "$@" >/dev/null 2>"$errfile" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      rm -f "$errfile"
+      return 0
+    fi
+    err="$(cat "$errfile")"
+    if [[ "$err" == *"MalformedPolicyDocument"* && "$err" == *"Invalid principal"* && "$attempt" -lt 8 ]]; then
+      echo "Retry $((attempt + 1))/8 for ${description}: Invalid principal"
+      sleep 10
+      attempt=$((attempt + 1))
+      continue
+    fi
+    echo "$err" >&2
+    rm -f "$errfile"
+    return "$status"
+  done
+}
+
 ensure_role() {
   local name="$1"
   local policy_file="$2"
   if aws iam get-role --role-name "$name" >/dev/null 2>&1; then
-    aws iam update-assume-role-policy --role-name "$name" --policy-document "file://${WORKDIR}/trust.json"
+    retry_trust_principal "update trust policy for ${name}" \
+      aws iam update-assume-role-policy --role-name "$name" --policy-document "file://${WORKDIR}/trust.json"
     aws iam update-role --role-name "$name" --max-session-duration 3600 >/dev/null
     echo "Updated role ${name}."
   else
-    aws iam create-role --role-name "$name" --assume-role-policy-document "file://${WORKDIR}/trust.json" --max-session-duration 3600 >/dev/null
+    retry_trust_principal "create role ${name}" \
+      aws iam create-role --role-name "$name" --assume-role-policy-document "file://${WORKDIR}/trust.json" --max-session-duration 3600
     echo "Created role ${name}."
   fi
   aws iam put-role-policy --role-name "$name" --policy-name invoke-review-api --policy-document "file://${policy_file}"
